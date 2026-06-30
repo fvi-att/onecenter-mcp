@@ -54,7 +54,6 @@ func TestSaveDemandLocally_DM_A1(t *testing.T) {
 		DemandRecordID       string `json:"demand_record_id"`
 		Saved                bool   `json:"saved"`
 		Uploaded             bool   `json:"uploaded"`
-		ConsentRequired      bool   `json:"consent_required"`
 		NextAction           string `json:"next_action"`
 		AssistantInstruction string `json:"assistant_instruction"`
 	}
@@ -64,16 +63,16 @@ func TestSaveDemandLocally_DM_A1(t *testing.T) {
 	if !out.Saved || out.Uploaded || out.DemandRecordID == "" {
 		t.Fatalf("DM-A1: expected saved=true uploaded=false with id, got %+v", out)
 	}
-	if !out.ConsentRequired || out.NextAction != "ask_user_for_upload_consent" {
-		t.Fatalf("B57: expected an explicit conversational opt-in next action, got %+v", out)
+	if out.NextAction != "call_upload_demand_for_preview" {
+		t.Fatalf("DM-A1: expected next_action=call_upload_demand_for_preview, got %+v", out)
 	}
-	for _, required := range []string{"Ask the user", "chance to earn dcent", "Do not call upload_demand unless", "explicitly agrees", "demand_record_id"} {
+	for _, required := range []string{"upload_demand", "demand_record_id", "preview"} {
 		if !strings.Contains(out.AssistantInstruction, required) {
-			t.Fatalf("B57: assistant instruction must contain %q, got %q", required, out.AssistantInstruction)
+			t.Fatalf("DM-A1: assistant instruction must contain %q, got %q", required, out.AssistantInstruction)
 		}
 	}
 	if strings.Contains(out.AssistantInstruction, "PDF") || strings.Contains(out.AssistantInstruction, "SECRET") {
-		t.Fatalf("B57: assistant instruction must not echo private demand contents: %q", out.AssistantInstruction)
+		t.Fatalf("DM-A1: assistant instruction must not echo private demand contents: %q", out.AssistantInstruction)
 	}
 
 	// remote には何も送られない
@@ -146,9 +145,8 @@ func TestListLocalDemands(t *testing.T) {
 	}
 }
 
-// ── DM-A2: upload_demand (opt-in) でのみ descriptor が共有される ──────────────
-func TestUploadDemand_DM_A2_OptInShares(t *testing.T) {
-	t.Setenv("OC_DISCOVER_EMIT", "on") // 明示同意
+// ── DM-A2: upload_demand preview → confirm → descriptor が共有される ──────────
+func TestUploadDemand_DM_A2_PreviewThenConfirm(t *testing.T) {
 	mock := newMockAPI(nil)
 	ts := httptest.NewServer(mock)
 	defer ts.Close()
@@ -165,33 +163,63 @@ func TestUploadDemand_DM_A2_OptInShares(t *testing.T) {
 	}
 	json.Unmarshal([]byte(toolResultText(saveRes)), &saved)
 
-	upRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+	// confirm なし → プレビューを返す (remote 非接触)
+	previewRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
 		"demand_record_id": saved.DemandRecordID,
 	}))
 	if err != nil {
-		t.Fatalf("DM-A2: upload error: %v", err)
+		t.Fatalf("DM-A2 preview: unexpected error: %v", err)
+	}
+	if toolResultIsError(previewRes) {
+		t.Fatalf("DM-A2 preview: unexpected tool error: %s", toolResultText(previewRes))
+	}
+	previewText := toolResultText(previewRes)
+	// confirm_required アクションが含まれること
+	if !strings.Contains(previewText, "confirm_required") {
+		t.Fatalf("DM-A2 preview: expected confirm_required action, got: %s", previewText)
+	}
+	// will_send に descriptor が省略なく含まれること
+	if !strings.Contains(previewText, "PDF 表抽出 API") {
+		t.Fatalf("DM-A2 preview: descriptor must appear in will_send without omission")
+	}
+	// will_encrypt_on_server に raw_friction が含まれること (B71 deliver-proxy: server が暗号化する)
+	if !strings.Contains(previewText, "will_encrypt_on_server") {
+		t.Fatalf("DM-A2 preview: will_encrypt_on_server must appear in preview to inform user of encryption")
+	}
+	// プレビュー時点では remote に送らない
+	if len(mock.demandSignals) != 0 {
+		t.Fatalf("DM-A2 preview: no signal should be posted before confirm, got %d", len(mock.demandSignals))
+	}
+
+	// confirm=true → 実際に POST /demand/signals
+	upRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved.DemandRecordID,
+		"confirm":          true,
+	}))
+	if err != nil {
+		t.Fatalf("DM-A2 confirm: upload error: %v", err)
 	}
 	if toolResultIsError(upRes) {
-		t.Fatalf("DM-A2: unexpected upload tool error: %s", toolResultText(upRes))
+		t.Fatalf("DM-A2 confirm: unexpected upload tool error: %s", toolResultText(upRes))
 	}
 
 	// 既存 POST /demand/signals に 1 件共有された
 	if len(mock.demandSignals) != 1 {
-		t.Fatalf("DM-A2: expected 1 demand signal posted, got %d", len(mock.demandSignals))
+		t.Fatalf("DM-A2 confirm: expected 1 demand signal posted, got %d", len(mock.demandSignals))
 	}
 	sig := mock.demandSignals[0]
 	if sig["semantic_descriptor"] != "PDF 表抽出 API" {
-		t.Fatalf("DM-A2: descriptor not shared correctly: %v", sig["semantic_descriptor"])
+		t.Fatalf("DM-A2 confirm: descriptor not shared correctly: %v", sig["semantic_descriptor"])
 	}
 	if sig["zero_seller"] != true {
-		t.Fatalf("DM-A2: expected zero_seller=true, got %v", sig["zero_seller"])
+		t.Fatalf("DM-A2 confirm: expected zero_seller=true, got %v", sig["zero_seller"])
 	}
-	// raw_friction / context は送らない (privacy)
-	if _, leaked := sig["raw_friction"]; leaked {
-		t.Fatalf("DM-A2: raw_friction must NOT be uploaded")
+	// B71 deliver-proxy: raw_friction と context も API に送る (server 側で暗号化して content_encrypted に保管)。
+	if sig["raw_friction"] != "SECRET-PROJECT の決算処理で詰まった" {
+		t.Fatalf("DM-A2 confirm: raw_friction must be sent for deliver-proxy (B71): %v", sig["raw_friction"])
 	}
-	if _, leaked := sig["context"]; leaked {
-		t.Fatalf("DM-A2: context must NOT be uploaded")
+	if sig["context"] != "social-graph 案件" {
+		t.Fatalf("DM-A2 confirm: context must be sent for deliver-proxy (B71): %v", sig["context"])
 	}
 
 	// レコードは uploaded=true に書き戻される
@@ -200,43 +228,16 @@ func TestUploadDemand_DM_A2_OptInShares(t *testing.T) {
 	var rec map[string]any
 	json.Unmarshal(raw, &rec)
 	if rec["uploaded"] != true {
-		t.Fatalf("DM-A2: record should be marked uploaded=true, got %v", rec["uploaded"])
+		t.Fatalf("DM-A2 confirm: record should be marked uploaded=true, got %v", rec["uploaded"])
 	}
 
-	// 二重 upload は弾く
-	dupRes, _ := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{"demand_record_id": saved.DemandRecordID}))
+	// 二重 upload は弾く (confirm=true でも)
+	dupRes, _ := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved.DemandRecordID,
+		"confirm":          true,
+	}))
 	if !toolResultIsError(dupRes) {
 		t.Fatalf("DM-A2: re-upload should error")
-	}
-}
-
-// ── DM-A2 (privacy gate): 同意がないと upload は remote 非接触 ────────────────
-func TestUploadDemand_ConsentRequired(t *testing.T) {
-	for _, mode := range []string{"", "off", "private"} {
-		t.Run(mode, func(t *testing.T) {
-			t.Setenv("OC_DISCOVER_EMIT", mode)
-			mock := newMockAPI(nil)
-			ts := httptest.NewServer(mock)
-			defer ts.Close()
-			sdk := newDemandTestSDK(t, ts)
-
-			saveRes, _ := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{"descriptor": "x"}))
-			var saved struct {
-				DemandRecordID string `json:"demand_record_id"`
-			}
-			json.Unmarshal([]byte(toolResultText(saveRes)), &saved)
-
-			res, _ := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{"demand_record_id": saved.DemandRecordID}))
-			if !toolResultIsError(res) {
-				t.Fatalf("mode=%q: upload should be blocked without consent", mode)
-			}
-			if !strings.Contains(toolResultText(res), "consent_required") {
-				t.Fatalf("mode=%q: expected consent_required error, got %s", mode, toolResultText(res))
-			}
-			if len(mock.demandSignals) != 0 {
-				t.Fatalf("mode=%q: nothing should be posted remotely, got %d", mode, len(mock.demandSignals))
-			}
-		})
 	}
 }
 
@@ -276,7 +277,6 @@ func TestGetStatus_B58(t *testing.T) {
 	for _, d := range []string{"PDF 表抽出", "Excel→JSON 変換"} {
 		sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{"descriptor": d}))
 	}
-	t.Setenv("OC_DISCOVER_EMIT", "on")
 	listRes, _ := sdk.handleListLocalDemands(context.Background(), makeCallReq(nil))
 	var listed struct {
 		Records []struct {
@@ -284,7 +284,10 @@ func TestGetStatus_B58(t *testing.T) {
 		} `json:"records"`
 	}
 	json.Unmarshal([]byte(toolResultText(listRes)), &listed)
-	sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{"demand_record_id": listed.Records[0].DemandRecordID}))
+	sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": listed.Records[0].DemandRecordID,
+		"confirm":          true,
+	}))
 
 	result2, _ := sdk.handleGetStatus(context.Background(), makeCallReq(nil))
 	var out2 struct {
@@ -305,14 +308,77 @@ func TestGetStatus_B58(t *testing.T) {
 	}
 }
 
-func TestUploadDemand_NotFound(t *testing.T) {
-	t.Setenv("OC_DISCOVER_EMIT", "on")
+// ── B67: OC_NO_UPLOAD_DEMAND opt-out ─────────────────────────────────────────
+func TestUploadDemand_B67_OptOut(t *testing.T) {
+	t.Setenv("OC_NO_UPLOAD_DEMAND", "1")
+
 	mock := newMockAPI(nil)
 	ts := httptest.NewServer(mock)
 	defer ts.Close()
 	sdk := newDemandTestSDK(t, ts)
 
-	res, _ := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{"demand_record_id": "does-not-exist"}))
+	saveRes, _ := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
+		"descriptor": "テスト需要",
+	}))
+	var saved struct {
+		DemandRecordID string `json:"demand_record_id"`
+	}
+	json.Unmarshal([]byte(toolResultText(saveRes)), &saved)
+
+	res, _ := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved.DemandRecordID,
+		"confirm":          true,
+	}))
+	if !toolResultIsError(res) {
+		t.Fatalf("B67: expected upload_disabled error when OC_NO_UPLOAD_DEMAND=1")
+	}
+	if !strings.Contains(toolResultText(res), "OC_NO_UPLOAD_DEMAND=1") {
+		t.Fatalf("B67: error message must mention OC_NO_UPLOAD_DEMAND=1, got: %s", toolResultText(res))
+	}
+	if len(mock.demandSignals) != 0 {
+		t.Fatalf("B67: no signal must be posted when upload disabled, got %d", len(mock.demandSignals))
+	}
+}
+
+func TestUploadDemand_B67_DefaultAllows(t *testing.T) {
+	mock := newMockAPI(nil)
+	ts := httptest.NewServer(mock)
+	defer ts.Close()
+	sdk := newDemandTestSDK(t, ts)
+
+	saveRes, _ := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
+		"descriptor": "デフォルト許可テスト",
+	}))
+	var saved struct {
+		DemandRecordID string `json:"demand_record_id"`
+	}
+	json.Unmarshal([]byte(toolResultText(saveRes)), &saved)
+
+	res, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved.DemandRecordID,
+		"confirm":          true,
+	}))
+	if err != nil {
+		t.Fatalf("B67 default: unexpected error: %v", err)
+	}
+	if toolResultIsError(res) {
+		t.Fatalf("B67 default: upload must succeed without OC_NO_UPLOAD_DEMAND, got: %s", toolResultText(res))
+	}
+	if len(mock.demandSignals) != 1 {
+		t.Fatalf("B67 default: expected 1 signal posted, got %d", len(mock.demandSignals))
+	}
+}
+
+func TestUploadDemand_NotFound(t *testing.T) {
+	mock := newMockAPI(nil)
+	ts := httptest.NewServer(mock)
+	defer ts.Close()
+	sdk := newDemandTestSDK(t, ts)
+
+	res, _ := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": "does-not-exist",
+		"confirm":          true,
+	}))
 	if !toolResultIsError(res) {
 		t.Fatalf("expected not_found error for missing record")
 	}
@@ -320,5 +386,63 @@ func TestUploadDemand_NotFound(t *testing.T) {
 	dir := filepath.Dir(sdk.demandFilePath("_"))
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Fatalf("expected empty demand dir, got %d entries", len(entries))
+	}
+}
+
+// ── B76: unlock 価格は platform 固定値。アップロード者は価格を設定しない ──────────
+// save_demand_locally に min_unlock_dcents を渡しても保存されず、upload の POST body にも含まれないこと。
+func TestUploadDemand_B76_NoPerSignalUnlockPrice(t *testing.T) {
+	mock := newMockAPI(nil)
+	ts := httptest.NewServer(mock)
+	defer ts.Close()
+	sdk := newDemandTestSDK(t, ts)
+
+	// save_demand_locally — 旧 min_unlock_dcents 引数を渡しても無視されること。
+	saveRes, err := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
+		"descriptor":         "機械翻訳 API (DE→JA 専門語対応)",
+		"unmet_value_dcents": float64(50),
+		"min_unlock_dcents":  float64(100), // 旧パラメータ; 無視される
+	}))
+	if err != nil {
+		t.Fatalf("B76: save error: %v", err)
+	}
+	if toolResultIsError(saveRes) {
+		t.Fatalf("B76: unexpected save tool error: %s", toolResultText(saveRes))
+	}
+	var saved struct {
+		DemandRecordID string `json:"demand_record_id"`
+	}
+	if err := json.Unmarshal([]byte(toolResultText(saveRes)), &saved); err != nil {
+		t.Fatalf("B76: bad save output JSON: %v", err)
+	}
+
+	// 保存レコードに min_unlock_dcents フィールドが無いこと。
+	path := sdk.demandFilePath(saved.DemandRecordID)
+	raw, _ := os.ReadFile(path)
+	var rec map[string]any
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("B76: bad record JSON: %v", err)
+	}
+	if _, present := rec["min_unlock_dcents"]; present {
+		t.Fatalf("B76: stored record must not carry min_unlock_dcents, got %v", rec["min_unlock_dcents"])
+	}
+
+	// upload_demand (confirm=true) → POST body に min_unlock_dcents が含まれないこと。
+	upRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved.DemandRecordID,
+		"confirm":          true,
+	}))
+	if err != nil {
+		t.Fatalf("B76: upload error: %v", err)
+	}
+	if toolResultIsError(upRes) {
+		t.Fatalf("B76: unexpected upload tool error: %s", toolResultText(upRes))
+	}
+	if len(mock.demandSignals) != 1 {
+		t.Fatalf("B76: expected 1 demand signal posted, got %d", len(mock.demandSignals))
+	}
+	sig := mock.demandSignals[0]
+	if _, present := sig["min_unlock_dcents"]; present {
+		t.Fatalf("B76: posted signal must not carry min_unlock_dcents, got %v", sig["min_unlock_dcents"])
 	}
 }

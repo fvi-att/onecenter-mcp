@@ -231,10 +231,9 @@ func makeCallReq(args map[string]any) mcp.CallToolRequest {
 	return req
 }
 
-// ── D1: discover → 0 件 → 明示opt-in時だけ demand_signal 記録 ───────────────
+// ── D1: discover → 0 件 → save_demand_locally ヒントが含まれる ──────────────
 
-func TestDiscoverCapability_D1_ZeroResult_RecordsDemandSignal(t *testing.T) {
-	t.Setenv("OC_DISCOVER_EMIT", "on")
+func TestDiscoverCapability_D1_ZeroResult_ShowsSaveTip(t *testing.T) {
 	mock := newMockAPI([]map[string]any{testWordCountCap})
 	ts := httptest.NewServer(mock)
 	defer ts.Close()
@@ -246,83 +245,15 @@ func TestDiscoverCapability_D1_ZeroResult_RecordsDemandSignal(t *testing.T) {
 		t.Fatalf("D1: unexpected error: %v", err)
 	}
 
-	// demand signal が記録されたこと
-	if len(mock.demandSignals) != 1 {
-		t.Errorf("D1: expected 1 demand signal, got %d", len(mock.demandSignals))
-	}
-	sig := mock.demandSignals[0]
-	if sig["zero_seller"] != true {
-		t.Errorf("D1: demand signal should have zero_seller=true, got %v", sig["zero_seller"])
+	// 自動 demand_signal は送らない
+	if len(mock.demandSignals) != 0 {
+		t.Errorf("D1: expected 0 demand signals (auto-emit removed), got %d", len(mock.demandSignals))
 	}
 
-	// レスポンスに demand_recorded=true が含まれること
+	// 0件メッセージに save_demand_locally ヒントが含まれること
 	text := toolResultText(result)
-	if !strings.Contains(text, "demand_recorded") {
-		t.Errorf("D1: response should mention demand_recorded, got: %s", text)
-	}
-}
-
-func TestDiscoverCapability_D1_MaxPricePropagatedToDemand(t *testing.T) {
-	t.Setenv("OC_DISCOVER_EMIT", "on")
-	mock := newMockAPI([]map[string]any{testWordCountCap})
-	ts := httptest.NewServer(mock)
-	defer ts.Close()
-	sdk := newTestSDK(ts)
-
-	req := makeCallReq(map[string]any{"query": "blockchain NFT", "max_price_dcents": float64(100)})
-	_, err := sdk.handleDiscoverCapability(context.Background(), req)
-	if err != nil {
-		t.Fatalf("D1-price: %v", err)
-	}
-
-	if len(mock.demandSignals) != 1 {
-		t.Fatalf("D1-price: expected 1 demand signal, got %d", len(mock.demandSignals))
-	}
-	// unmet_value_cents (max_price_dcents) が転記されること (flow discover-to-demand :filter-as-value)
-	unmet := mock.demandSignals[0]["unmet_value_cents"]
-	if unmet == nil {
-		t.Errorf("D1-price: demand signal should have unmet_value_cents")
-	}
-}
-
-func TestDiscoverEmitMode_FailClosedAndExplicit(t *testing.T) {
-	tests := []struct {
-		value string
-		want  discoverEmitMode
-	}{
-		{"", discoverEmitOff},
-		{"off", discoverEmitOff},
-		{"unexpected", discoverEmitOff},
-		{"private", discoverEmitPrivate},
-		{"on", discoverEmitOn},
-		{"TRUE", discoverEmitOn},
-	}
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			t.Setenv("OC_DISCOVER_EMIT", tt.value)
-			if got := currentDiscoverEmitMode(); got != tt.want {
-				t.Fatalf("mode=%q: got %q, want %q", tt.value, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestRecordDemandSignal_PrivacyModesDoNotPost(t *testing.T) {
-	for _, mode := range []string{"", "off", "private", "invalid"} {
-		t.Run(mode, func(t *testing.T) {
-			t.Setenv("OC_DISCOVER_EMIT", mode)
-			mock := newMockAPI(nil)
-			ts := httptest.NewServer(mock)
-			defer ts.Close()
-			sdk := newTestSDK(ts)
-
-			if sdk.recordDemandSignal(context.Background(), "PRIVATE project acquisition", 100) {
-				t.Fatalf("mode=%q unexpectedly reported a remote demand signal", mode)
-			}
-			if len(mock.demandSignals) != 0 {
-				t.Fatalf("mode=%q posted %d demand signals", mode, len(mock.demandSignals))
-			}
-		})
+	if !strings.Contains(text, "save_demand_locally") {
+		t.Errorf("D1: response should mention save_demand_locally, got: %s", text)
 	}
 }
 

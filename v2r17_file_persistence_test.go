@@ -265,14 +265,13 @@ func TestV2R17FilePersistence(t *testing.T) {
 	if savedSA["role"] != "seller" {
 		t.Errorf("AP-S1: role want=seller got=%v", savedSA["role"])
 	}
-	if savedSA["sig_b"] == nil || savedSA["sig_b"] == "" {
-		t.Errorf("AP-S1: sig_b が空 (署名なし)")
+	if _, exists := savedSA["sig_b"]; exists {
+		t.Errorf("AP-S1: B79d seller record must not contain sig_b")
 	}
 	log.log("  ファイル存在: %s ✓", filepath.Base(expectedSellerPath))
 	log.log("  パーミッション: %04o ✓", sellerInfo.Mode().Perm())
 	log.log("  call_id     = %v ✓", savedSA["call_id"])
 	log.log("  role        = %v ✓", savedSA["role"])
-	log.log("  sig_b       = %v... ✓", fmt.Sprint(savedSA["sig_b"])[:min(16, len(fmt.Sprint(savedSA["sig_b"])))])
 	log.log("  settled_at  = %v ✓", savedSA["settled_at"])
 	log.log("  AP-S1 PASS ✓")
 

@@ -377,8 +377,8 @@ func TestV2R18LocalStore(t *testing.T) {
 	if sellerAgreement["role"] != "seller" {
 		t.Errorf("R18-LS-A2: role want=seller got=%v", sellerAgreement["role"])
 	}
-	if sellerAgreement["sig_b"] == nil || sellerAgreement["sig_b"] == "" {
-		t.Error("R18-LS-A2: sig_b が空 (Seller 署名なし)")
+	if _, exists := sellerAgreement["sig_b"]; exists {
+		t.Error("R18-LS-A2: B79d seller record must not contain sig_b")
 	}
 	if sellerAgreement["settled_at"] == nil || sellerAgreement["settled_at"] == "" {
 		t.Error("R18-LS-A2: settled_at が空")
@@ -387,7 +387,6 @@ func TestV2R18LocalStore(t *testing.T) {
 	log.log("  ✓ Seller agreement ファイル存在: seller/%s.json", sellerCallID[:8]+"...")
 	log.log("  ✓ パーミッション: 0600")
 	log.log("  ✓ role = seller")
-	log.log("  ✓ sig_b = %v...", fmt.Sprint(sellerAgreement["sig_b"])[:min(16, len(fmt.Sprint(sellerAgreement["sig_b"])))])
 	log.log("  ✓ settled_at = %v", sellerAgreement["settled_at"])
 	log.log("  R18-LS-A1/A2 PASS ✓")
 

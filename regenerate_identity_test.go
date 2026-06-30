@@ -136,9 +136,9 @@ func TestRegenerateIdentity_R2_Seller_ReSeeds(t *testing.T) {
 	if sdk.buyerAgentID != oldBuyer {
 		t.Errorf("R2: buyer should be unchanged for role=seller")
 	}
-	// first-party capability を再 seed したこと (3 件; word_count/echo_text/billing_summary)
-	if mock.seededCaps != 3 {
-		t.Errorf("R2: expected 3 re-seeded capabilities, got %d", mock.seededCaps)
+	// first-party capability seed は B65 で撤廃 (echo_text/word_count/billing_summary は MCP ツールから削除済み)
+	if mock.seededCaps != 0 {
+		t.Errorf("R2: expected 0 seeded capabilities (seed removed in B65), got %d", mock.seededCaps)
 	}
 	if len(mock.registeredRoles) != 1 || mock.registeredRoles[0] != "seller" {
 		t.Errorf("R2: expected one seller registration, got %v", mock.registeredRoles)
@@ -273,8 +273,8 @@ func TestRegenerateIdentity_R6_NewIdentityUsedInCall(t *testing.T) {
 	if ce["buyer_agent_id"] != newBuyer {
 		t.Errorf("R6: call event buyer_agent_id should be new identity %s, got %v", newBuyer, ce["buyer_agent_id"])
 	}
-	// dual-sig (SigA + SigB) が付与されていること
-	if ce["sig_a"] == nil || ce["sig_b"] == nil {
-		t.Errorf("R6: call event should carry sig_a and sig_b after regenerate")
+	// B79d: meter payload is cred-only and must not carry agreement signatures.
+	if ce["sig_a"] != nil || ce["sig_b"] != nil {
+		t.Errorf("R6: cred-only call event must not carry sig_a/sig_b")
 	}
 }

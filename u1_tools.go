@@ -20,30 +20,6 @@ import (
 
 // registerU1Tools registers the U1 core toolset on the MCP server.
 func registerU1Tools(s *server.MCPServer, oc *ocSDK) {
-	s.AddTool(
-		mcp.NewTool("echo_text",
-			mcp.WithDescription("Echoes input text back with an optional prefix. 10đ/call (OneCenter postpaid billing)."),
-			mcp.WithString("text", mcp.Required(), mcp.Description("Text to echo")),
-			mcp.WithString("prefix", mcp.Description("Optional prefix (default: [echo])")),
-		),
-		oc.handleEcho,
-	)
-
-	s.AddTool(
-		mcp.NewTool("word_count",
-			mcp.WithDescription("Counts words, sentences, and characters. 5đ/call (OneCenter postpaid billing)."),
-			mcp.WithString("text", mcp.Required(), mcp.Description("Text to analyze")),
-		),
-		oc.handleWordCount,
-	)
-
-	s.AddTool(
-		mcp.NewTool("billing_summary",
-			mcp.WithDescription("Returns your current session billing summary from OneCenter API (free)."),
-		),
-		oc.handleBillingSummary,
-	)
-
 	// show_identity — 現在の MCP server identity を表示 (v2-r23 / *mcp-show-identity-tool*)
 	// billable=false。再起動後に同一 agent_id が維持されているか確認できる。
 	s.AddTool(
@@ -123,27 +99,6 @@ func registerU1Tools(s *server.MCPServer, oc *ocSDK) {
 			mcp.WithNumber("limit", mcp.Description("Max results (default: 10)")),
 		),
 		oc.handleDiscoverCapability,
-	)
-
-	s.AddTool(
-		mcp.NewTool("call_capability",
-			mcp.WithDescription("Call a capability by ID (call=purchase). Charges đ from your wallet. Use discover_capability first to find capability IDs."),
-			mcp.WithString("capability_id", mcp.Required(), mcp.Description("Capability UUID from discover_capability")),
-			mcp.WithObject("input", mcp.Description("Input object per the capability's io_schema")),
-			mcp.WithNumber("max_price_dcents", mcp.Description("Max price cap in đ — call is rejected if price exceeds this (optional)")),
-		),
-		oc.handleCallCapability,
-	)
-
-	s.AddTool(
-		mcp.NewTool("transfer_dcent",
-			mcp.WithDescription("Transfer đ from this Buyer agent wallet to another agent. Simple transfer only: no capability call, no purchase_agreement, no SigB."),
-			mcp.WithString("to_agent_id", mcp.Required(), mcp.Description("Receiver agent_id")),
-			mcp.WithNumber("dcents", mcp.Required(), mcp.Description("Amount in đ; must be > 0")),
-			mcp.WithString("memo", mcp.Description("Optional memo stored as untrusted transfer metadata")),
-			mcp.WithString("transfer_id", mcp.Description("Optional idempotency UUID. If omitted, the MCP client generates one.")),
-		),
-		oc.handleTransferDcent,
 	)
 }
 
@@ -661,12 +616,6 @@ func (s *ocSDK) handleDiscoverCapability(ctx context.Context, req mcp.CallToolRe
 	raw, _ := io.ReadAll(resp.Body)
 	json.Unmarshal(raw, &apiResp)
 
-	// GA1: 該当ゼロのとき demand_signal を自動記録 (flow discover-to-demand)
-	demandRecorded := false
-	if apiResp.Total == 0 {
-		demandRecorded = s.recordDemandSignal(ctx, query, maxPriceDcents)
-	}
-
 	// Build output: add callable flag, rename price_cents → price_dcents (no conversion; W4)
 	type capOut struct {
 		ID           string `json:"id"`
@@ -706,16 +655,15 @@ func (s *ocSDK) handleDiscoverCapability(ctx context.Context, req mcp.CallToolRe
 	}
 
 	out := map[string]any{
-		"capabilities":    caps,
-		"total":           apiResp.Total,
-		"demand_recorded": demandRecorded,
+		"capabilities": caps,
+		"total":        apiResp.Total,
 	}
 	outJSON, _ := json.MarshalIndent(out, "", "  ")
 
 	if apiResp.Total == 0 {
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"No capabilities found for query: %q\nDemand signal recorded: %v\n\n%s",
-			query, demandRecorded, string(outJSON))), nil
+			"No capabilities found for query: %q\nTip: call save_demand_locally to record this miss, then upload_demand to share it with OneCenter.\n\n%s",
+			query, string(outJSON))), nil
 	}
 	return mcp.NewToolResultText(string(outJSON)), nil
 }
@@ -824,7 +772,7 @@ func (s *ocSDK) handleCallCapability(ctx context.Context, req mcp.CallToolReques
 				})
 				return mcp.NewToolResultError(string(errBody)), nil
 			}
-			// settle 失敗 (401 dual_sig_required / invalid_agreement_signature 等) は
+			// settle 失敗 (401 agent_cred_required / 403 buyer_mismatch 等) は
 			// call=purchase 契約の不成立。execution は走ったが課金が成立していないため、
 			// success=true で誤魔化さず error として返す (*call-as-purchase* :atomicity)。
 			fmt.Fprintf(os.Stderr, "[call_capability] settle failed: %v\n", settleErr)
@@ -836,7 +784,7 @@ func (s *ocSDK) handleCallCapability(ctx context.Context, req mcp.CallToolReques
 		} else {
 			balanceDcentsAfter = s.getWalletBalance(ctx, s.buyerAgentID)
 
-			// *purchase-agreement* :local-storage — Buyer runtime: settle 成功後に保存 (v2-r17: ファイル永続化)
+			// ローカル決済記録 — Buyer runtime: settle 成功後に保存 (v2-r17: ファイル永続化)
 			// キーは "buyer:<call_id>" — Seller 側 ("seller:<call_id>") と共存し精算照合可能にする。
 			buyerRec := map[string]any{
 				"role":            "buyer",
@@ -874,7 +822,7 @@ func (s *ocSDK) handleCallCapability(ctx context.Context, req mcp.CallToolReques
 }
 
 // handleTransferDcent — Buyer 起点の単純送金 (v2-r27 / dcw-r3).
-// capability call ではないため purchase_agreement / SigB / POST /meter/calls は使わない。
+// capability call ではないため課金 (POST /meter/calls) は使わない。
 func (s *ocSDK) handleTransferDcent(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	toAgentID, _ := args["to_agent_id"].(string)

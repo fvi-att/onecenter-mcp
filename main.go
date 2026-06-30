@@ -44,18 +44,6 @@ type identityConfig struct {
 	UpdatedAt     string `json:"updated_at"`
 }
 
-// ── PurchaseAgreement — *purchase-agreement* (v2-r6) ─────────────────────────
-// フィールドはアルファベット順で定義 (canonical JSON のキー順 = struct 宣言順)。
-// sig_a / sig_b は agreement struct の外に置き、署名ループを防ぐ。
-type PurchaseAgreement struct {
-	AgreedCents   int64  `json:"agreed_cents"`
-	BuyerAgentID  string `json:"buyer_agent_id"`
-	CallID        string `json:"call_id"`
-	CapabilityID  string `json:"capability_id"`
-	ExpiresAt     int64  `json:"expires_at"` // Unix 秒
-	SellerAgentID string `json:"seller_agent_id"`
-}
-
 // InsufficientDcentError — POST /meter/calls 402 時に返るエラー (T3 settle-delegation)
 type InsufficientDcentError struct {
 	Body map[string]any
@@ -73,9 +61,9 @@ type ocSDK struct {
 	sessionID      string
 	buyerAgentID   string
 	buyerCred      string             // buyer agent cred (self-register 時に取得; buyer wallet 参照に使う)
-	privKey        ed25519.PrivateKey // Seller 秘密鍵 (SigB)
+	privKey        ed25519.PrivateKey // Seller 秘密鍵 (capability 署名)
 	pubKeyB64      string             // base64url(Seller public key raw 32 bytes)
-	buyerPrivKey   ed25519.PrivateKey // Buyer 秘密鍵 (SigA; v2-r19)
+	buyerPrivKey   ed25519.PrivateKey // Buyer 秘密鍵 (identity material)
 	buyerPubKeyB64 string             // base64url(Buyer public key raw 32 bytes)
 	client         *http.Client
 
@@ -177,8 +165,6 @@ func newOcSDK() *ocSDK {
 	// F5/R4: 公開鍵を OneCenter に登録 (idempotent; 再起動時の 409 は無視)
 	sdk.registerPubkey()
 	sdk.registerBuyerPubkey()
-	// T1: first-party capability を registry に seed (API MemStore は起動ごとにリセット)
-	sdk.seedFirstPartyCapabilities()
 	// v2-r17: ファイルから Quotation/Agreement を runtime memory に復元する
 	sdk.hydrateFromFiles()
 	return sdk
@@ -361,7 +347,7 @@ func (s *ocSDK) registerPubkey() {
 	fmt.Fprintf(os.Stderr, "[oc-sdk] seller pubkey registered for agent %s (status %d)\n", s.agentID, resp.StatusCode)
 }
 
-// registerBuyerPubkey — POST /agents/:buyerID/pubkeys Buyer 公開鍵登録 (v2-r19 dual-sig SigA)
+// registerBuyerPubkey — POST /agents/:buyerID/pubkeys Buyer 公開鍵登録 (identity pubkey)
 // POST /agents/:id/pubkeys は auth 不要 (main.go router rl のみ) のためベストエフォートで登録する。
 func (s *ocSDK) registerBuyerPubkey() {
 	body, _ := json.Marshal(map[string]any{
@@ -434,8 +420,6 @@ func (s *ocSDK) regenerateIdentity(role string) (map[string]any, error) {
 		s.privKey = priv
 		s.pubKeyB64 = base64.RawURLEncoding.EncodeToString(pub)
 		s.registerPubkey()
-		// 新 seller agent_id で first-party capability を再 seed する (seller_agent_id を新 ID に紐付け直す)
-		s.seedFirstPartyCapabilities()
 		out["seller_agent_id"] = id
 		out["seller_pubkey_hint"] = s.pubKeyB64[:min(8, len(s.pubKeyB64))]
 	}
@@ -443,97 +427,6 @@ func (s *ocSDK) regenerateIdentity(role string) (map[string]any, error) {
 	return out, nil
 }
 
-// signBuyerBytes — Buyer 秘密鍵で bytes に署名 → base64url (SigA; v2-r19)
-func (s *ocSDK) signBuyerBytes(data []byte) string {
-	digest := sha256.Sum256(data)
-	sig := ed25519.Sign(s.buyerPrivKey, digest[:])
-	return base64.RawURLEncoding.EncodeToString(sig)
-}
-
-// signBuyerAgreement — canonical_json(agreement) → sha256 → ed25519_sign(buyerPrivKey) → base64url (SigA)
-func (s *ocSDK) signBuyerAgreement(agreement *PurchaseAgreement) (string, error) {
-	canonical, err := json.Marshal(agreement)
-	if err != nil {
-		return "", err
-	}
-	return s.signBuyerBytes(canonical), nil
-}
-
-// seedFirstPartyCapabilities — T1: @onecenter/operator.* 3 件を registry に登録する。
-// MemStore は再起動でリセットされるため、MCP サーバー起動ごとに実行する。
-// (*first-party-capabilities* / LQ-first-party-seed / plan T1)
-func (s *ocSDK) seedFirstPartyCapabilities() {
-	type capDef struct {
-		toolName, desc, pricing string
-		priceDcents             int64
-	}
-	defs := []capDef{
-		{"word_count", "Count words, sentences, and characters in text. Returns word/sentence/character counts.", "per-call", 5},
-		{"echo_text", "Echo input text back with an optional prefix string.", "per-call", 10},
-		{"billing_summary", "Return billing summary including đ balance and recent call history for the agent.", "free", 0},
-	}
-
-	for _, d := range defs {
-		name := "@onecenter/operator." + d.toolName
-		body, _ := json.Marshal(map[string]any{
-			"name":            name,
-			"description":     d.desc,
-			"seller_agent_id": s.agentID,
-			"mcp_endpoint":    "mcp://onecenter-operator/" + d.toolName,
-			"protocol":        "mcp",
-			"pricing_model":   d.pricing,
-			"price_cents":     d.priceDcents,
-		})
-		resp, err := s.client.Post(s.oncenterURL+"/capabilities", "application/json", bytes.NewReader(body))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oc-sdk] seedCapability %q failed: %v\n", name, err)
-			continue
-		}
-		resp.Body.Close()
-		fmt.Fprintf(os.Stderr, "[oc-sdk] seeded capability: %s (status %d)\n", name, resp.StatusCode)
-	}
-}
-
-// signBytes — bytes → ed25519_sign → base64url (*agent-pki-spec*)
-func (s *ocSDK) signBytes(data []byte) string {
-	digest := sha256.Sum256(data)
-	sig := ed25519.Sign(s.privKey, digest[:])
-	return base64.RawURLEncoding.EncodeToString(sig)
-}
-
-// generateAgreement — v2-r6 PurchaseAgreement を生成する (Seller として; 既存 capabilityID 用)
-func (s *ocSDK) generateAgreement(cents int64) (*PurchaseAgreement, error) {
-	callID := uuid.New().String()
-	return &PurchaseAgreement{
-		AgreedCents:   cents,
-		BuyerAgentID:  s.buyerAgentID,
-		CallID:        callID,
-		CapabilityID:  s.capabilityID,
-		ExpiresAt:     time.Now().Add(60 * time.Second).Unix(),
-		SellerAgentID: s.agentID,
-	}, nil
-}
-
-// generateAgreementFor — 任意 capID / buyerID / sellerID / dcents で agreement を生成する (T3)
-func (s *ocSDK) generateAgreementFor(capID, buyerAgentID, sellerAgentID string, dcents int64) *PurchaseAgreement {
-	return &PurchaseAgreement{
-		AgreedCents:   dcents,
-		BuyerAgentID:  buyerAgentID,
-		CallID:        uuid.New().String(),
-		CapabilityID:  capID,
-		ExpiresAt:     time.Now().Add(60 * time.Second).Unix(),
-		SellerAgentID: sellerAgentID,
-	}
-}
-
-// signAgreement — canonical_json(agreement) → sha256 → ed25519_sign → base64url (SigB)
-func (s *ocSDK) signAgreement(agreement *PurchaseAgreement) (string, error) {
-	canonical, err := json.Marshal(agreement)
-	if err != nil {
-		return "", err
-	}
-	return s.signBytes(canonical), nil
-}
 
 // B4: spend-cap チェック (同期; handler 実行前)
 func (s *ocSDK) checkSpendCap(cents int) (allowed bool, remainingCents int, err error) {
@@ -556,32 +449,14 @@ func (s *ocSDK) checkSpendCap(cents int) (allowed bool, remainingCents int, err 
 	return result.Allowed, result.RemainingCents, nil
 }
 
-// recordCall — v2-r19: agreement + SigA (Buyer) + SigB (Seller) dual-sig で POST /meter/calls (fire-and-forget)
+// recordCall — B79d: cred-only POST /meter/calls (fire-and-forget)
+// Buyer 自身の cred で認証する。canonical price/seller は server が capability から確定する。
 func (s *ocSDK) recordCall(toolName string, cents int, inputHash, outputHash string, latencyMs int64) {
 	go func() {
-		agreement, err := s.generateAgreement(int64(cents))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oc-sdk] generateAgreement failed: %v\n", err)
-			return
-		}
-		sigA, err := s.signBuyerAgreement(agreement) // SigA: Buyer 署名
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oc-sdk] signBuyerAgreement failed: %v\n", err)
-			return
-		}
-		sigB, err := s.signAgreement(agreement) // SigB: Seller countersign
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oc-sdk] signAgreement failed: %v\n", err)
-			return
-		}
-
 		payload := map[string]any{
-			"agreement":       agreement,
-			"sig_a":           sigA,
-			"sig_b":           sigB,
 			"agreed_cents":    int64(cents),
 			"currency":        "dcent",
-			"call_id":         agreement.CallID,
+			"call_id":         uuid.New().String(),
 			"capability_id":   s.capabilityID,
 			"tool_name":       toolName,
 			"buyer_agent_id":  s.buyerAgentID,
@@ -593,45 +468,40 @@ func (s *ocSDK) recordCall(toolName string, cents int, inputHash, outputHash str
 			"latency_ms":      latencyMs,
 			"mcp_session_id":  s.sessionID,
 			"occurred_at":     time.Now().UTC().Format(time.RFC3339),
-			"sdk_version":     "0.5.0-go-r22",
+			"sdk_version":     "0.6.0-go-b79d",
 			"pubkey_hint":     s.pubKeyB64[:min(8, len(s.pubKeyB64))],
 		}
 
 		body, _ := json.Marshal(payload)
-		resp, err := s.client.Post(s.oncenterURL+"/meter/calls", "application/json", bytes.NewReader(body))
+		req, err := http.NewRequest("POST", s.oncenterURL+"/meter/calls", bytes.NewReader(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[oc-sdk] recordCall build req failed: %v\n", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+s.buyerCred)
+		resp, err := s.client.Do(req)
 		if err == nil {
 			var res map[string]any
 			json.NewDecoder(resp.Body).Decode(&res)
 			resp.Body.Close()
-			fmt.Fprintf(os.Stderr, "[oc-sdk] call recorded: tool=%s agreed_cents=%d sig_verified=%v\n",
-				toolName, cents, res["sig_verified"])
+			fmt.Fprintf(os.Stderr, "[oc-sdk] call recorded: tool=%s agreed_cents=%v\n",
+				toolName, res["agreed_cents"])
 		} else {
 			fmt.Fprintf(os.Stderr, "[oc-sdk] recordCall POST failed: %v\n", err)
 		}
 	}()
 }
 
-// recordCallSync — 同期版 recordCall。POST /meter/calls の応答を返す。
-// 402 (残高不足) の場合は *InsufficientDcentError を返す (T3 settle-delegation)。
-// 戻り値の string は使用した call_id (Buyer 側の Agreement ローカル保存に利用)。
+// recordCallSync — 同期版 recordCall (B79d: cred-only)。POST /meter/calls の応答を返す。
+// Buyer 自身の cred で認証する。402 (残高不足) の場合は *InsufficientDcentError を返す。
+// 戻り値の string は使用した call_id (Buyer 側のローカル決済記録の保存に利用)。
 func (s *ocSDK) recordCallSync(ctx context.Context, toolName, capID, buyerAgentID, sellerAgentID string, dcents int64, inputHash, outputHash string, latencyMs int64) (string, error) {
-	agreement := s.generateAgreementFor(capID, buyerAgentID, sellerAgentID, dcents)
-	sigA, err := s.signBuyerAgreement(agreement) // SigA: Buyer 署名 (v2-r19)
-	if err != nil {
-		return "", err
-	}
-	sigB, err := s.signAgreement(agreement) // SigB: Seller countersign
-	if err != nil {
-		return "", err
-	}
-
+	callID := uuid.New().String()
 	payload := map[string]any{
-		"agreement":       agreement,
-		"sig_a":           sigA,
-		"sig_b":           sigB,
 		"agreed_cents":    dcents,
 		"currency":        "dcent",
-		"call_id":         agreement.CallID,
+		"call_id":         callID,
 		"capability_id":   capID,
 		"tool_name":       toolName,
 		"buyer_agent_id":  buyerAgentID,
@@ -643,13 +513,14 @@ func (s *ocSDK) recordCallSync(ctx context.Context, toolName, capID, buyerAgentI
 		"latency_ms":      latencyMs,
 		"mcp_session_id":  s.sessionID,
 		"occurred_at":     time.Now().UTC().Format(time.RFC3339),
-		"sdk_version":     "0.5.0-go-t3-r19",
+		"sdk_version":     "0.6.0-go-b79d",
 		"pubkey_hint":     s.pubKeyB64[:min(8, len(s.pubKeyB64))],
 	}
 
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, "POST", s.oncenterURL+"/meter/calls", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.buyerCred)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -663,42 +534,40 @@ func (s *ocSDK) recordCallSync(ctx context.Context, toolName, capID, buyerAgentI
 		return "", &InsufficientDcentError{Body: errBody}
 	}
 
-	// 202 Accepted 以外は settle 失敗。401 (dual_sig_required / invalid_agreement_signature)、
-	// 409 (duplicate_call_id)、410 (agreement_expired) などを *握り潰さず* エラーとして返す。
+	// 202 Accepted 以外は settle 失敗。401 (agent_cred_required)、403 (buyer_mismatch)、
+	// 409 (duplicate_call_id) などを *握り潰さず* エラーとして返す。
 	// (これを返さないと call_capability が record されていない call を success=true と誤報告する)
 	if resp.StatusCode != http.StatusAccepted {
 		raw, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("POST /meter/calls failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
-	// *purchase-agreement* :local-storage — Seller runtime: POST 成功後に保存 (v2-r17: ファイル永続化)
+	// ローカル決済記録 — Seller runtime: POST 成功後に保存 (v2-r17: ファイル永続化)
 	// キーは "seller:<call_id>" — Buyer 側 ("buyer:<call_id>") と共存できるようにする
 	s.amu.Lock()
-	if _, seen := s.seenCallIDs[agreement.CallID]; !seen {
-		s.seenCallIDs[agreement.CallID] = struct{}{}
+	if _, seen := s.seenCallIDs[callID]; !seen {
+		s.seenCallIDs[callID] = struct{}{}
 		rec := map[string]any{
 			"role":            "seller",
-			"call_id":         agreement.CallID,
+			"call_id":         callID,
 			"capability_id":   capID,
 			"agreed_dcents":   dcents,
 			"buyer_agent_id":  buyerAgentID,
 			"seller_agent_id": sellerAgentID,
-			"expires_at":      agreement.ExpiresAt,
-			"sig_b":           sigB,
 			"settled_at":      time.Now().UTC().Format(time.RFC3339),
 		}
-		s.localAgreements["seller:"+agreement.CallID] = rec
+		s.localAgreements["seller:"+callID] = rec
 		s.amu.Unlock()
 		// v2-r17: ファイル永続化 (~/.onecenter/p2p/<agent_id>/agreements/seller/<call_id>.json; 0600)
-		if path := s.p2pFilePath("agreements", "seller", agreement.CallID); path != "" {
+		if path := s.p2pFilePath("agreements", "seller", callID); path != "" {
 			if err := saveP2PFile(path, rec); err != nil {
-				fmt.Fprintf(os.Stderr, "[p2p-store] save seller agreement failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "[p2p-store] save seller record failed: %v\n", err)
 			}
 		}
 	} else {
 		s.amu.Unlock()
 	}
-	return agreement.CallID, nil
+	return callID, nil
 }
 
 // getWalletBalance — GET /dcent/wallets/:agentID → balance_dcents
@@ -763,50 +632,6 @@ func (s *ocSDK) transferDcent(ctx context.Context, toAgentID string, dcents int6
 	return result, resp.StatusCode, nil
 }
 
-type discoverEmitMode string
-
-const (
-	discoverEmitOff     discoverEmitMode = "off"
-	discoverEmitPrivate discoverEmitMode = "private"
-	discoverEmitOn      discoverEmitMode = "on"
-)
-
-// currentDiscoverEmitMode is fail-closed: only an explicit on value permits
-// sending a discover query to OneCenter. private records neither remotely nor
-// locally today, so raw project context cannot leak into an artifact.
-func currentDiscoverEmitMode() discoverEmitMode {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("OC_DISCOVER_EMIT"))) {
-	case "on", "1", "true", "yes":
-		return discoverEmitOn
-	case "private":
-		return discoverEmitPrivate
-	default:
-		return discoverEmitOff
-	}
-}
-
-// recordDemandSignal — POST /demand/signals (discover 不発時の GA1 燃料; flow discover-to-demand).
-// Sending the raw query requires explicit OC_DISCOVER_EMIT=on consent.
-func (s *ocSDK) recordDemandSignal(ctx context.Context, query string, maxPriceDcents int64) bool {
-	if currentDiscoverEmitMode() != discoverEmitOn {
-		return false
-	}
-	body, _ := json.Marshal(map[string]any{
-		"semantic_descriptor": query,
-		"unmet_value_cents":   maxPriceDcents,
-		"zero_seller":         true,
-	})
-	req, _ := http.NewRequestWithContext(ctx, "POST", s.oncenterURL+"/demand/signals", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] recordDemandSignal failed: %v\n", err)
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusAccepted
-}
 
 func hashStr(s string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(s)))
@@ -956,7 +781,6 @@ func main() {
 	)
 
 	registerU1Tools(s, oc)
-	registerU2QuotationTools(s, oc)
 	registerDemandMarketTools(s, oc)
 
 	if err := server.ServeStdio(s); err != nil {

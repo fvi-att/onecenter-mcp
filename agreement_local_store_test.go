@@ -94,7 +94,7 @@ func TestAgreementLocalStore(t *testing.T) {
 	if !ok {
 		t.Fatalf("ALS-S1: localAgreements[seller:%s] が存在しない", callID)
 	}
-	checkFields := []string{"role", "call_id", "capability_id", "agreed_dcents", "sig_b", "settled_at"}
+	checkFields := []string{"role", "call_id", "capability_id", "agreed_dcents", "settled_at"}
 	for _, f := range checkFields {
 		if rec[f] == nil || rec[f] == "" {
 			t.Errorf("ALS-S1: localAgreements[%s][%q] が空", callID, f)
@@ -111,7 +111,9 @@ func TestAgreementLocalStore(t *testing.T) {
 	log.log("    call_id      = %v", rec["call_id"])
 	log.log("    capability_id= %v", rec["capability_id"])
 	log.log("    agreed_dcents= %v", rec["agreed_dcents"])
-	log.log("    sig_b        = %v...(%d chars)", fmt.Sprint(rec["sig_b"])[:min(16, len(fmt.Sprint(rec["sig_b"])))], len(fmt.Sprint(rec["sig_b"])))
+	if _, exists := rec["sig_b"]; exists {
+		t.Error("ALS-S1: B79d seller record must not contain sig_b")
+	}
 	log.log("    settled_at   = %v", rec["settled_at"])
 	log.log("  ALS-S1 PASS ✓")
 
