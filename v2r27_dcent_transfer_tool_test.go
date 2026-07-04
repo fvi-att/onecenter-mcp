@@ -25,8 +25,8 @@ func TestTransferDcentTool_R27SimpleTransfer(t *testing.T) {
 		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"transfer_id":                 gotBody["transfer_id"],
-			"from_agent_id":               "buyer-001",
-			"to_agent_id":                 gotBody["to_agent_id"],
+			"from_principal_id":           "principal-1",
+			"to_principal_id":             gotBody["to_principal_id"],
 			"dcents":                      gotBody["dcents"],
 			"sender_balance_dcents_after": 75,
 		})
@@ -34,18 +34,17 @@ func TestTransferDcentTool_R27SimpleTransfer(t *testing.T) {
 	defer ts.Close()
 
 	sdk := &ocSDK{
-		apiKey:       "oc_agt_seller",
-		buyerCred:    "oc_agt_buyer",
-		buyerAgentID: "buyer-001",
-		oncenterURL:  ts.URL,
-		client:       ts.Client(),
+		cred:        "oc_prn_test",
+		principalID: "principal-1",
+		oncenterURL: ts.URL,
+		client:      ts.Client(),
 	}
 
 	result, err := sdk.handleTransferDcent(context.Background(), makeCallReq(map[string]any{
-		"to_agent_id": "receiver-001",
-		"dcents":      float64(25),
-		"memo":        "tip",
-		"transfer_id": "transfer-001",
+		"to_principal_id": "principal-2",
+		"dcents":          float64(25),
+		"memo":            "tip",
+		"transfer_id":     "transfer-001",
 	}))
 	if err != nil {
 		t.Fatalf("transfer_dcent returned error: %v", err)
@@ -53,13 +52,10 @@ func TestTransferDcentTool_R27SimpleTransfer(t *testing.T) {
 	if toolResultIsError(result) {
 		t.Fatalf("transfer_dcent tool error: %s", toolResultText(result))
 	}
-	if gotAuth != "Bearer oc_agt_buyer" {
-		t.Fatalf("expected buyer bearer auth, got %q", gotAuth)
+	if gotAuth != "Bearer oc_prn_test" {
+		t.Fatalf("expected principal bearer auth, got %q", gotAuth)
 	}
-	if gotBody["from_agent_id"] != nil {
-		t.Fatalf("from_agent_id must not be sent; got body=%v", gotBody)
-	}
-	if gotBody["to_agent_id"] != "receiver-001" || gotBody["dcents"] != float64(25) || gotBody["memo"] != "tip" {
+	if gotBody["to_principal_id"] != "principal-2" || gotBody["dcents"] != float64(25) || gotBody["memo"] != "tip" {
 		t.Fatalf("unexpected transfer body: %v", gotBody)
 	}
 
@@ -67,7 +63,7 @@ func TestTransferDcentTool_R27SimpleTransfer(t *testing.T) {
 	if err := json.Unmarshal([]byte(toolResultText(result)), &out); err != nil {
 		t.Fatalf("decode tool result: %v", err)
 	}
-	if out["from_agent_id"] != "buyer-001" || out["to_agent_id"] != "receiver-001" {
+	if out["from_principal_id"] != "principal-1" || out["to_principal_id"] != "principal-2" {
 		t.Fatalf("unexpected tool output: %v", out)
 	}
 }
@@ -85,14 +81,14 @@ func TestTransferDcentTool_R27InsufficientBalance(t *testing.T) {
 	defer ts.Close()
 
 	sdk := &ocSDK{
-		buyerCred:   "oc_agt_buyer",
+		cred:        "oc_prn_test",
 		oncenterURL: ts.URL,
 		client:      ts.Client(),
 	}
 
 	result, err := sdk.handleTransferDcent(context.Background(), makeCallReq(map[string]any{
-		"to_agent_id": "receiver-001",
-		"dcents":      float64(25),
+		"to_principal_id": "principal-2",
+		"dcents":          float64(25),
 	}))
 	if err != nil {
 		t.Fatalf("transfer_dcent returned error: %v", err)

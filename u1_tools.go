@@ -10,31 +10,27 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
-	"time"
 
+	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 // registerU1Tools registers the U1 core toolset on the MCP server.
 func registerU1Tools(s *server.MCPServer, oc *ocSDK) {
-	// show_identity — 現在の MCP server identity を表示 (v2-r23 / *mcp-show-identity-tool*)
-	// billable=false。再起動後に同一 agent_id が維持されているか確認できる。
+	// show_identity — current Principal identity.
 	s.AddTool(
 		mcp.NewTool("show_identity",
-			mcp.WithDescription("Show current MCP server identity: seller/buyer agent_id, pubkey fingerprint, storage_backend (file|ephemeral), and đ balances. Use after restart to confirm identity persistence (v2-r23)."),
+			mcp.WithDescription("Show the current Principal ID, public-key fingerprint, storage backend, identity file, and đ balance."),
 		),
 		oc.handleShowIdentity,
 	)
 
-	// regenerate_identity — agent_id + Ed25519 keypair を作り直す (v2-r23; *mcp-regenerate-identity-tool*)
-	// confirm=true のみ実行 (dry-run がデフォルト)。永続化モードでは identity.json + keypair file を更新する。
+	// regenerate_identity creates a new Principal and keypair; confirm=true is required.
 	s.AddTool(
 		mcp.NewTool("regenerate_identity",
-			mcp.WithDescription("Regenerate this agent's identity (new agent_id + Ed25519 keypair). Dry-run by default — pass confirm=true to execute. In file storage mode, persists to identity.json and keypair files. Old đ balance is NOT carried over; request airdrop for the new agent."),
-			mcp.WithString("role", mcp.Description("Which identity to regenerate: buyer | seller | both (default: buyer)")),
+			mcp.WithDescription("Create a new Principal and Ed25519 keypair. Dry-run by default; pass confirm=true to execute. The old đ balance is not carried over."),
 			mcp.WithBoolean("confirm", mcp.Description("Must be true to execute; omit or false for dry-run (safety default)")),
 		),
 		oc.handleRegenerateIdentity,
@@ -107,19 +103,7 @@ func (s *ocSDK) handleEcho(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	text, _ := args["text"].(string)
 	prefix, _ := args["prefix"].(string)
 
-	allowed, remaining, err := s.checkSpendCap(10)
-	if err != nil {
-		return mcp.NewToolResultText("OneCenter API unreachable: " + err.Error()), nil
-	}
-	if !allowed {
-		return mcp.NewToolResultError(fmt.Sprintf("spend_cap_exceeded: remaining %dđ", remaining)), nil
-	}
-
-	start := time.Now()
 	result := echoResult(text, prefix)
-	latency := time.Since(start).Milliseconds()
-
-	s.recordCall("echo_text", 10, hashStr(text), hashStr(result), latency)
 	return mcp.NewToolResultText(result), nil
 }
 
@@ -127,19 +111,7 @@ func (s *ocSDK) handleWordCount(ctx context.Context, req mcp.CallToolRequest) (*
 	args := req.GetArguments()
 	text, _ := args["text"].(string)
 
-	allowed, remaining, err := s.checkSpendCap(5)
-	if err != nil {
-		return mcp.NewToolResultText("OneCenter API unreachable: " + err.Error()), nil
-	}
-	if !allowed {
-		return mcp.NewToolResultError(fmt.Sprintf("spend_cap_exceeded: remaining %dđ", remaining)), nil
-	}
-
-	start := time.Now()
 	result := wordCountResult(text)
-	latency := time.Since(start).Milliseconds()
-
-	s.recordCall("word_count", 5, hashStr(text), hashStr(result), latency)
 	return mcp.NewToolResultText(result), nil
 }
 
@@ -195,7 +167,7 @@ func (s *ocSDK) handleRadioCreateChannel(ctx context.Context, req mcp.CallToolRe
 	apiURL := s.oncenterURL + "/channels"
 	httpReq, _ := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(b))
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+s.cred)
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
@@ -250,7 +222,7 @@ func (s *ocSDK) handleRadioPost(ctx context.Context, req mcp.CallToolRequest) (*
 	apiURL := fmt.Sprintf("%s/channels/%s/posts", s.oncenterURL, url.PathEscape(slug))
 	httpReq, _ := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(b))
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+s.cred)
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
@@ -382,7 +354,7 @@ func (s *ocSDK) handleRadioAcceptBounty(ctx context.Context, req mcp.CallToolReq
 	apiURL := fmt.Sprintf("%s/channels/%s/posts/%s/accept", s.oncenterURL, url.PathEscape(slug), url.PathEscape(strings.TrimSpace(postID)))
 	httpReq, _ := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(b))
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+s.cred)
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
@@ -419,25 +391,18 @@ func (s *ocSDK) handleRadioAcceptBounty(ctx context.Context, req mcp.CallToolReq
 }
 
 func (s *ocSDK) handleBillingSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	text := s.getBillingSummaryText(ctx, s.agentID)
+	text := s.getBillingSummaryText(ctx)
 	return mcp.NewToolResultText(text), nil
 }
 
-// ── show_identity — 現在の MCP server identity 情報を表示する (v2-r23; *mcp-show-identity-tool*) ──
-//
-// billable=false (identity 確認操作)
-// 出力: seller/buyer agent_id / pubkey fingerprint / storage_backend / đ 残高 / identity_file_path
+// ── show_identity ──
 func (s *ocSDK) handleShowIdentity(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	s.idmu.RLock()
-	sellerID := s.agentID
-	buyerID := s.buyerAgentID
-	sellerFP := s.pubKeyB64
-	if len(sellerFP) > 8 {
-		sellerFP = sellerFP[:8]
-	}
-	buyerFP := s.buyerPubKeyB64
-	if len(buyerFP) > 8 {
-		buyerFP = buyerFP[:8]
+	principalID := s.principalID
+	cred := s.cred
+	pubkeyFP := s.pubKeyB64
+	if len(pubkeyFP) > 8 {
+		pubkeyFP = pubkeyFP[:8]
 	}
 	backend := s.storageBackend
 	if backend == "" {
@@ -445,110 +410,40 @@ func (s *ocSDK) handleShowIdentity(ctx context.Context, _ mcp.CallToolRequest) (
 	}
 	s.idmu.RUnlock()
 
-	sellerBal := s.getWalletBalance(ctx, sellerID)
-	buyerBal := s.getWalletBalance(ctx, buyerID)
+	balance := s.getWalletBalance(ctx, principalID, cred)
 
 	out := map[string]any{
-		"seller_agent_id":       sellerID,
-		"buyer_agent_id":        buyerID,
-		"seller_pubkey_fp":      sellerFP,
-		"buyer_pubkey_fp":       buyerFP,
-		"storage_backend":       backend,
-		"identity_file_path":    s.identityFilePath(),
-		"seller_balance_dcents": sellerBal,
-		"buyer_balance_dcents":  buyerBal,
-	}
-	if backend == "ephemeral" {
-		out["note"] = "WARNING: storage_backend=ephemeral. Restart will generate a new agent_id and reset đ balance. " +
-			"Ensure ~/.onecenter/mcp/ is writable and OC_API_KEY is unset for persistence."
+		"principal_id":       principalID,
+		"pubkey_fp":          pubkeyFP,
+		"balance_dcents":     balance,
+		"storage_backend":    backend,
+		"identity_file_path": s.identityFilePath(),
 	}
 	outJSON, _ := json.MarshalIndent(out, "", "  ")
 	return mcp.NewToolResultText(string(outJSON)), nil
 }
 
-// ── regenerate_identity — agent_id + Ed25519 keypair を作り直す (v2-r23; *mcp-regenerate-identity-tool*) ──
-//
-// billable=false。confirm=true のみ実行; それ以外は dry-run を返す (誤操作防止)。
-// 永続化モード (storageBackend=file) の場合は keypair file + identity.json を更新する。
+// ── regenerate_identity ──
 func (s *ocSDK) handleRegenerateIdentity(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-	role, _ := args["role"].(string)
-	confirm, _ := args["confirm"].(bool)
-
+	confirm, _ := req.GetArguments()["confirm"].(bool)
 	if !confirm {
-		// dry-run: 現在の残高と警告を返すだけ (state 変更なし)
-		s.idmu.RLock()
-		sellerID := s.agentID
-		buyerID := s.buyerAgentID
-		s.idmu.RUnlock()
-		sellerBal := s.getWalletBalance(ctx, sellerID)
-		buyerBal := s.getWalletBalance(ctx, buyerID)
-		out := map[string]any{
-			"dry_run":                       true,
-			"would_reset":                   role,
-			"current_seller_balance_dcents": sellerBal,
-			"current_buyer_balance_dcents":  buyerBal,
-			"warning":                       "旧 đ 残高は引き継がれない。実行前に operator airdrop を記録してください。confirm=true を渡して実行してください。",
-		}
-		outJSON, _ := json.MarshalIndent(out, "", "  ")
-		return mcp.NewToolResultText(string(outJSON)), nil
+		balance := s.getWalletBalance(ctx, s.principalID, s.cred)
+		out, _ := json.MarshalIndent(map[string]any{
+			"dry_run":                true,
+			"current_balance_dcents": balance,
+			"warning":                "A new Principal will not inherit the current đ balance. Pass confirm=true to continue.",
+		}, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
 	}
-
-	info, err := s.regenerateIdentity(role)
+	info, err := s.regenerateIdentity("")
 	if err != nil {
-		errBody, _ := json.Marshal(map[string]any{
-			"error":   "regenerate_failed",
-			"message": err.Error(),
-		})
-		return mcp.NewToolResultError(string(errBody)), nil
+		body, _ := json.Marshal(map[string]any{"error": "regenerate_failed", "message": err.Error()})
+		return mcp.NewToolResultError(string(body)), nil
 	}
-
-	// 永続化モードでは keypair file + identity.json を更新 (flow mcp-identity-first-run F3/F4 を再実行)
-	s.idmu.RLock()
-	backend := s.storageBackend
-	agentID := s.agentID
-	apiKey := s.apiKey
-	buyerAgentID := s.buyerAgentID
-	buyerCred := s.buyerCred
-	sellerPrivKey := s.privKey
-	buyerPrivKey := s.buyerPrivKey
-	s.idmu.RUnlock()
-
-	if backend == "file" {
-		if role == "seller" || role == "both" {
-			if err := saveMCPKey(s.mcpKeyFilePath("seller", agentID), sellerPrivKey); err != nil {
-				fmt.Fprintf(os.Stderr, "[oc-sdk] WARNING: failed to save seller keypair: %v\n", err)
-			}
-		}
-		if role == "buyer" || role == "both" {
-			if err := saveMCPKey(s.mcpKeyFilePath("buyer", buyerAgentID), buyerPrivKey); err != nil {
-				fmt.Fprintf(os.Stderr, "[oc-sdk] WARNING: failed to save buyer keypair: %v\n", err)
-			}
-		}
-		// identity.json を全フィールド更新 (created_at は既存を引き継ぐ)
-		cfg := &identityConfig{
-			SellerAgentID: agentID,
-			SellerCred:    apiKey,
-			BuyerAgentID:  buyerAgentID,
-			BuyerCred:     buyerCred,
-		}
-		if existing, err := loadIdentityConfig(s.identityFilePath()); err == nil {
-			cfg.CreatedAt = existing.CreatedAt
-		}
-		if cfg.CreatedAt == "" {
-			cfg.CreatedAt = time.Now().UTC().Format(time.RFC3339)
-		}
-		if err := saveIdentityConfig(s.identityFilePath(), cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "[oc-sdk] WARNING: failed to update identity.json: %v\n", err)
-		}
-	}
-
 	info["regenerated"] = true
-	info["storage_backend"] = backend
-	info["note"] = "New agent identity and Ed25519 keypair generated and registered. " +
-		"旧 đ 残高は引き継がれない。新 agent への airdrop が必要です。"
-	outJSON, _ := json.MarshalIndent(info, "", "  ")
-	return mcp.NewToolResultText(string(outJSON)), nil
+	info["storage_backend"] = s.storageBackend
+	out, _ := json.MarshalIndent(info, "", "  ")
+	return mcp.NewToolResultText(string(out)), nil
 }
 
 // ── T3: discover_capability — 自然言語で capability を探す (*discover-capability-tool*) ──
@@ -586,7 +481,7 @@ func (s *ocSDK) handleDiscoverCapability(ctx context.Context, req mcp.CallToolRe
 
 	apiURL := fmt.Sprintf("%s/capabilities?%s", s.oncenterURL, params.Encode())
 	httpReq, _ := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+s.cred)
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
@@ -601,7 +496,7 @@ func (s *ocSDK) handleDiscoverCapability(ctx context.Context, req mcp.CallToolRe
 			Description  string `json:"description"`
 			Protocol     string `json:"protocol"`
 			PricingModel string `json:"pricing_model"`
-			PriceCents   int64  `json:"price_cents"`
+			PriceDcents  int64  `json:"price_dcents"`
 			SigStatus    string `json:"sig_status"`
 			Reputation   struct {
 				SuccessRate  float64 `json:"success_rate"`
@@ -609,14 +504,13 @@ func (s *ocSDK) handleDiscoverCapability(ctx context.Context, req mcp.CallToolRe
 				P95LatencyMs int     `json:"p95_latency_ms"`
 				Volume30d    int     `json:"volume_30d"`
 			} `json:"reputation"`
-			SellerAgentID string `json:"seller_agent_id"`
 		} `json:"capabilities"`
 		Total int `json:"total"`
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	json.Unmarshal(raw, &apiResp)
 
-	// Build output: add callable flag, rename price_cents → price_dcents (no conversion; W4)
+	// Build output: retain the API's d-cent-only price field (W4).
 	type capOut struct {
 		ID           string `json:"id"`
 		Name         string `json:"name"`
@@ -641,7 +535,7 @@ func (s *ocSDK) handleDiscoverCapability(ctx context.Context, req mcp.CallToolRe
 			ID:           c.ID,
 			Name:         c.Name,
 			Descriptor:   c.Description,
-			PriceDcents:  c.PriceCents,
+			PriceDcents:  c.PriceDcents,
 			PricingModel: c.PricingModel,
 			Protocol:     c.Protocol,
 			SigStatus:    c.SigStatus,
@@ -661,9 +555,29 @@ func (s *ocSDK) handleDiscoverCapability(ctx context.Context, req mcp.CallToolRe
 	outJSON, _ := json.MarshalIndent(out, "", "  ")
 
 	if apiResp.Total == 0 {
+		// L-no-silent-stop / R-no-silent-stop (B83): 空結果を黙って返さない。
+		// 需要記録フローを user/AI 双方が拾えるよう構造化 next_actions として明示提示する。
+		zeroOut := map[string]any{
+			"capabilities": caps,
+			"total":        0,
+			"query":        query,
+			"next_actions": []map[string]any{
+				{
+					"tool":   "save_demand_locally",
+					"reason": "この検索ミスを需要としてローカルに記録する (remote 非送信)",
+					"args":   map[string]any{"query": query},
+				},
+				{
+					"tool":   "upload_demand",
+					"reason": "需要を OneCenter に共有しマッチング対象にする (明示 opt-in)",
+					"args":   map[string]any{"query": query},
+				},
+			},
+		}
+		zeroJSON, _ := json.MarshalIndent(zeroOut, "", "  ")
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"No capabilities found for query: %q\nTip: call save_demand_locally to record this miss, then upload_demand to share it with OneCenter.\n\n%s",
-			query, string(outJSON))), nil
+			"No capabilities found for query: %q\nThis is not a dead end — record it as demand:\n  • save_demand_locally — keep it locally (no remote send)\n  • upload_demand — share it with OneCenter (opt-in)\n\n%s",
+			query, string(zeroJSON))), nil
 	}
 	return mcp.NewToolResultText(string(outJSON)), nil
 }
@@ -688,7 +602,7 @@ func (s *ocSDK) handleCallCapability(ctx context.Context, req mcp.CallToolReques
 	// GET /capabilities/:id → manifest を解決
 	httpReq, _ := http.NewRequestWithContext(ctx, "GET",
 		fmt.Sprintf("%s/capabilities/%s", s.oncenterURL, capID), nil)
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+s.cred)
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
@@ -701,22 +615,22 @@ func (s *ocSDK) handleCallCapability(ctx context.Context, req mcp.CallToolReques
 	}
 
 	var cap struct {
-		ID            string `json:"id"`
-		Name          string `json:"name"`
-		Protocol      string `json:"protocol"`
-		MCPEndpoint   string `json:"mcp_endpoint"`
-		PriceCents    int64  `json:"price_cents"`
-		PricingModel  string `json:"pricing_model"`
-		SellerAgentID string `json:"seller_agent_id"`
+		ID                string `json:"id"`
+		Name              string `json:"name"`
+		Protocol          string `json:"protocol"`
+		MCPEndpoint       string `json:"mcp_endpoint"`
+		PriceDcents       int64  `json:"price_dcents"`
+		PricingModel      string `json:"pricing_model"`
+		SellerPrincipalID string `json:"seller_principal_id"`
 	}
 	capRaw, _ := io.ReadAll(resp.Body)
 	json.Unmarshal(capRaw, &cap)
 
 	// max_price_dcents ガード (Buyer 合意外の課金を事前拒否)
-	if v, ok := args["max_price_dcents"].(float64); ok && int64(v) < cap.PriceCents {
+	if v, ok := args["max_price_dcents"].(float64); ok && int64(v) < cap.PriceDcents {
 		errBody, _ := json.Marshal(map[string]any{
 			"error":        "price_exceeds_cap",
-			"price_dcents": cap.PriceCents,
+			"price_dcents": cap.PriceDcents,
 			"cap_dcents":   int64(v),
 		})
 		return mcp.NewToolResultError(string(errBody)), nil
@@ -746,65 +660,27 @@ func (s *ocSDK) handleCallCapability(ctx context.Context, req mcp.CallToolReques
 		})
 		return mcp.NewToolResultError(string(errBody)), nil
 	}
+	_ = latencyMs
 
-	// ── settle: đ 残高移動 (T2 dcent-call-settle に委譲) ──
-	chargedDcents := cap.PriceCents
+	// Paid execution settles through the Principal-to-Principal transfer rail.
+	chargedDcents := cap.PriceDcents
 	if cap.PricingModel == "free" {
 		chargedDcents = 0
 	}
 
 	var balanceDcentsAfter int64
 	if chargedDcents > 0 {
-		settledCallID, settleErr := s.recordCallSync(ctx,
-			strings.TrimPrefix(cap.Name, "@onecenter/operator."),
-			capID, s.buyerAgentID, cap.SellerAgentID,
-			chargedDcents,
-			hashStr(fmt.Sprint(inputRaw)), hashStr(result),
-			latencyMs)
-
-		if settleErr != nil {
-			if insuf, ok := settleErr.(*InsufficientDcentError); ok {
-				errBody, _ := json.Marshal(map[string]any{
-					"error":           "insufficient_dcent_balance",
-					"balance_dcents":  insuf.Body["balance_dcents"],
-					"required_dcents": insuf.Body["required_dcents"],
-					"hint":            "operator に POST /dcent/airdrops で追加 airdrop を要求してください",
-				})
-				return mcp.NewToolResultError(string(errBody)), nil
-			}
-			// settle 失敗 (401 agent_cred_required / 403 buyer_mismatch 等) は
-			// call=purchase 契約の不成立。execution は走ったが課金が成立していないため、
-			// success=true で誤魔化さず error として返す (*call-as-purchase* :atomicity)。
-			fmt.Fprintf(os.Stderr, "[call_capability] settle failed: %v\n", settleErr)
+		transfer, status, settleErr := s.transferDcent(ctx, cap.SellerPrincipalID, chargedDcents,
+			"capability purchase: "+capID, uuid.NewString())
+		if settleErr != nil || status < 200 || status >= 300 {
 			errBody, _ := json.Marshal(map[string]any{
-				"error":   "settle_failed",
-				"message": settleErr.Error(),
+				"error":    "settle_failed",
+				"message":  fmt.Sprint(settleErr),
+				"response": transfer,
 			})
 			return mcp.NewToolResultError(string(errBody)), nil
-		} else {
-			balanceDcentsAfter = s.getWalletBalance(ctx, s.buyerAgentID)
-
-			// ローカル決済記録 — Buyer runtime: settle 成功後に保存 (v2-r17: ファイル永続化)
-			// キーは "buyer:<call_id>" — Seller 側 ("seller:<call_id>") と共存し精算照合可能にする。
-			buyerRec := map[string]any{
-				"role":            "buyer",
-				"call_id":         settledCallID,
-				"capability_id":   capID,
-				"agreed_dcents":   chargedDcents,
-				"buyer_agent_id":  s.buyerAgentID,
-				"seller_agent_id": cap.SellerAgentID,
-				"settled_at":      time.Now().UTC().Format(time.RFC3339),
-			}
-			s.amu.Lock()
-			s.localAgreements["buyer:"+settledCallID] = buyerRec
-			s.amu.Unlock()
-			// v2-r17: ファイル永続化 (~/.onecenter/p2p/<agent_id>/agreements/buyer/<call_id>.json; 0600)
-			if path := s.p2pFilePath("agreements", "buyer", settledCallID); path != "" {
-				if err := saveP2PFile(path, buyerRec); err != nil {
-					fmt.Fprintf(os.Stderr, "[p2p-store] save buyer agreement failed: %v\n", err)
-				}
-			}
 		}
+		balanceDcentsAfter = s.getWalletBalance(ctx, s.principalID, s.cred)
 	}
 
 	out := map[string]any{
@@ -822,12 +698,12 @@ func (s *ocSDK) handleCallCapability(ctx context.Context, req mcp.CallToolReques
 }
 
 // handleTransferDcent — Buyer 起点の単純送金 (v2-r27 / dcw-r3).
-// capability call ではないため課金 (POST /meter/calls) は使わない。
+// capability call ではないため単純送金 rail を使う。
 func (s *ocSDK) handleTransferDcent(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
-	toAgentID, _ := args["to_agent_id"].(string)
-	if strings.TrimSpace(toAgentID) == "" {
-		return mcp.NewToolResultError("to_agent_id is required"), nil
+	toPrincipalID, _ := args["to_principal_id"].(string)
+	if strings.TrimSpace(toPrincipalID) == "" {
+		return mcp.NewToolResultError("to_principal_id is required"), nil
 	}
 	dcentsRaw, ok := args["dcents"].(float64)
 	if !ok || dcentsRaw <= 0 {
@@ -837,7 +713,7 @@ func (s *ocSDK) handleTransferDcent(ctx context.Context, req mcp.CallToolRequest
 	memo, _ := args["memo"].(string)
 	transferID, _ := args["transfer_id"].(string)
 
-	body, status, err := s.transferDcent(ctx, toAgentID, dcents, memo, transferID)
+	body, status, err := s.transferDcent(ctx, toPrincipalID, dcents, memo, transferID)
 	if err != nil {
 		return mcp.NewToolResultText("OneCenter API unreachable: " + err.Error()), nil
 	}
@@ -853,19 +729,3 @@ func (s *ocSDK) handleTransferDcent(ctx context.Context, req mcp.CallToolRequest
 	outJSON, _ := json.MarshalIndent(body, "", "  ")
 	return mcp.NewToolResultText(string(outJSON)), nil
 }
-
-// ── create_quotation — Seller が Buyer への Quotation を作成・ローカル保存する (v2-r17) ──
-//
-// *quotation-spec* :storage:
-//
-//	Seller パス: ~/.onecenter/p2p/<agent_id>/quotations/sent/<quotation_id>.json (0600)
-//	起動時 hydrate: hydrateFromFiles() が sent/ を読んで localQuotations["sent:<id>"] に復元する。
-//
-// billable=false (Quotation 作成は無課金; 課金は call_capability 時点)
-// バリデーション:
-//
-//	① tasks 配列の subtotal_dcents 整合性 (format=json のとき)
-//	② total_dcents ≥ 0
-//	③ to_buyer_agent_id / session_id / format が必須
-//
-// 戻り値: Quotation JSON (Seller が Buyer に P2P transport で送る素材)

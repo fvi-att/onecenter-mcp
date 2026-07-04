@@ -4,8 +4,8 @@
 //
 // Usage (.mcp.json): command="go" args=["run", "./cmd/mcp"]
 // Env:
-//   OC_BUYER_AGENT_ID   — Claude Code 側の buyer agent ID (default: claude-code-buyer)
-//   OC_API_KEY          — Seller の agent cred (default: oc_agt_seller_mock_key)
+//   OC_PRINCIPAL_ID     — Principal ID for credential injection mode
+//   OC_PRINCIPAL_CRED   — Principal CRED
 //   OC_CAPABILITY_ID    — 登録済み capability UUID
 //   ONECENTER_URL       — OneCenter API ベース URL (default: http://localhost:8080)
 
@@ -19,7 +19,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,218 +32,101 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// ── identityConfig — ~/.onecenter/mcp/identity.json のスキーマ (v2-r23 / *mcp-identity-file-spec*) ──
-// keypair (秘密鍵) は含めない — 漏洩時の被害を cred 再発行範囲に限定する。
+// identityConfig is the complete on-disk identity contract. The private key is
+// encoded as a base64url Ed25519 seed and the file itself is written mode 0600.
 type identityConfig struct {
-	SellerAgentID string `json:"seller_agent_id"`
-	SellerCred    string `json:"seller_cred"`
-	BuyerAgentID  string `json:"buyer_agent_id"`
-	BuyerCred     string `json:"buyer_cred"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
+	PrincipalID string `json:"principal_id"`
+	Cred        string `json:"cred"`
+	Pubkey      string `json:"pubkey"`
+	Privkey     string `json:"privkey"`
 }
-
-// InsufficientDcentError — POST /meter/calls 402 時に返るエラー (T3 settle-delegation)
-type InsufficientDcentError struct {
-	Body map[string]any
-}
-
-func (e *InsufficientDcentError) Error() string { return "insufficient_dcent_balance" }
-
-// ── oc-sdk (Go inline) + PKI (*agent-pki-spec*) ──────────────────────────────
 
 type ocSDK struct {
-	apiKey         string
-	agentID        string // Seller の agent_id (登録後に確定)
+	principalID    string
+	cred           string
 	capabilityID   string
 	oncenterURL    string
 	sessionID      string
-	buyerAgentID   string
-	buyerCred      string             // buyer agent cred (self-register 時に取得; buyer wallet 参照に使う)
-	privKey        ed25519.PrivateKey // Seller 秘密鍵 (capability 署名)
-	pubKeyB64      string             // base64url(Seller public key raw 32 bytes)
-	buyerPrivKey   ed25519.PrivateKey // Buyer 秘密鍵 (identity material)
-	buyerPubKeyB64 string             // base64url(Buyer public key raw 32 bytes)
+	privKey        ed25519.PrivateKey
+	pubKeyB64      string
 	client         *http.Client
-
-	// v2-pki-r2: identity フィールド (agentID/buyerAgentID/cred/keypair) を保護する。
-	// regenerate_identity tool が write lock を取って agent_id + keypair を作り直す。
-	idmu sync.RWMutex
-
-	// v2-r23: identity 永続化 (*mcp-identity-persistence-spec*)
-	// "file"=永続化済み / "ephemeral"=再起動で消える (OC_API_KEY env injection or 保存失敗)
+	idmu           sync.RWMutex
 	storageBackend string
-	// identityDir: テスト注入用 base dir (空文字のとき ~/.onecenter を使う)
-	identityDir string
-
-	// v2-r17: P2P ファイル永続化のベースディレクトリ。
-	// 空のとき: ~/.onecenter/p2p。テストでは tmpDir を注入して隔離する。
-	p2pBaseDir string
-
-	// B50: Demand Market ローカル DemandRecord 保存のベースディレクトリ (*demand-record-spec* :storage)。
-	// 空のとき: ~/.onecenter (→ <base>/demand/<id>.json)。テストでは tmpDir を注入して隔離する。
-	demandBaseDir string
-
-	// v2-r16: Quotation P2P-local ストレージ (*quotation-spec* :storage)
-	// OneCenter API には登録せず、Buyer runtime のローカルメモリで管理する。
-	localQuotations map[string]map[string]any // quotation_id → quotation
-	seenQIDs        map[string]struct{}       // replay 防止 (dedup)
-	qmu             sync.RWMutex
-
-	// Agreement P2P-local ストレージ (*purchase-agreement* :local-storage)
-	// Buyer: handleCallCapability 後に保存 (call_id keyed; replay 防止・精算照合)
-	// Seller: recordCallSync 成功後に保存 (課金ログ・dispute 証拠保全)
-	localAgreements map[string]map[string]any // call_id → agreement record
-	seenCallIDs     map[string]struct{}       // replay 防止 (call_id dedup)
-	amu             sync.RWMutex
+	identityDir    string
+	demandBaseDir  string
 }
 
 func newOcSDK() *ocSDK {
-	oncenterURL := getenv("ONECENTER_URL", "http://localhost:8080")
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-
-	// 初期 keypair を生成 (永続化モードでは loadPersistedIdentity が上書きする)
-	sellerPub, sellerPriv, err := ed25519.GenerateKey(rand.Reader)
+	baseURL := getenv("ONECENTER_URL", "http://localhost:8080")
+	client := &http.Client{Timeout: 10 * time.Second}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		panic("failed to generate Seller Ed25519 keypair: " + err.Error())
+		panic("failed to generate Ed25519 keypair: " + err.Error())
 	}
-	buyerPub, buyerPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		panic("failed to generate Buyer Ed25519 keypair: " + err.Error())
-	}
-
 	sdk := &ocSDK{
-		capabilityID:    getenv("OC_CAPABILITY_ID", "00000000-0000-0000-0000-000000000001"),
-		oncenterURL:     oncenterURL,
-		sessionID:       "claude-code-stdio-session",
-		privKey:         sellerPriv,
-		pubKeyB64:       base64.RawURLEncoding.EncodeToString(sellerPub),
-		buyerPrivKey:    buyerPriv,
-		buyerPubKeyB64:  base64.RawURLEncoding.EncodeToString(buyerPub),
-		client:          httpClient,
-		storageBackend:  "ephemeral",
-		localQuotations: make(map[string]map[string]any),
-		seenQIDs:        make(map[string]struct{}),
-		localAgreements: make(map[string]map[string]any),
-		seenCallIDs:     make(map[string]struct{}),
+		capabilityID:   getenv("OC_CAPABILITY_ID", "00000000-0000-0000-0000-000000000001"),
+		oncenterURL:    baseURL,
+		sessionID:      "claude-code-stdio-session",
+		privKey:        priv,
+		pubKeyB64:      base64.RawURLEncoding.EncodeToString(pub),
+		client:         client,
+		storageBackend: "ephemeral",
 	}
-
-	apiKey := getenv("OC_API_KEY", "")
-	if apiKey != "" {
-		// OC_API_KEY 設定済み → env injection モード (CI; ephemeral; DT4)
-		sdk.apiKey = apiKey
-		sdk.agentID = getenv("OC_SELLER_AGENT_ID", "")
-		sdk.buyerAgentID = getenv("OC_BUYER_AGENT_ID", "")
-		if sdk.buyerAgentID == "" {
-			if cred, id := selfRegister(httpClient, oncenterURL, "buyer", "onecenter-mcp-buyer"); id != "" {
-				sdk.buyerAgentID = id
-				sdk.buyerCred = cred
-			} else {
-				sdk.buyerAgentID = "claude-code-buyer"
-			}
-		}
-	} else {
-		// OC_API_KEY 未設定 → identity.json 永続化モード (flow mcp-identity-first-run / restart)
-		if !sdk.loadPersistedIdentity() {
-			// flow mcp-identity-first-run (F1 keypair 生成済み; F2 selfRegister; F3/F4 永続化; F5 pubkey 登録)
-			sdk.apiKey, sdk.agentID = selfRegister(httpClient, oncenterURL, "seller", "onecenter-mcp-seller")
-			if cred, id := selfRegister(httpClient, oncenterURL, "buyer", "onecenter-mcp-buyer"); id != "" {
-				sdk.buyerAgentID = id
-				sdk.buyerCred = cred
-			} else {
-				sdk.buyerAgentID = "claude-code-buyer"
-			}
-			// F3/F4: keypair + identity.json を永続化 (API 到達できた場合のみ)
-			if sdk.agentID != "" && sdk.buyerAgentID != "claude-code-buyer" {
-				sdk.storageBackend = sdk.persistIdentity()
-			}
-		}
-		// restart path: loadPersistedIdentity が agentID/cred/keypair を設定済み
+	if cred := getenv("OC_PRINCIPAL_CRED", getenv("OC_API_KEY", "")); cred != "" {
+		sdk.cred = cred
+		sdk.principalID = getenv("OC_PRINCIPAL_ID", "")
+		return sdk
 	}
-
-	// F5/R4: 公開鍵を OneCenter に登録 (idempotent; 再起動時の 409 は無視)
-	sdk.registerPubkey()
-	sdk.registerBuyerPubkey()
-	// v2-r17: ファイルから Quotation/Agreement を runtime memory に復元する
-	sdk.hydrateFromFiles()
+	if sdk.loadPersistedIdentity() {
+		return sdk
+	}
+	cred, principalID := registerPrincipal(client, baseURL, sdk.pubKeyB64, "onecenter-mcp")
+	if principalID == "" {
+		return sdk
+	}
+	sdk.cred = cred
+	sdk.principalID = principalID
+	sdk.storageBackend = sdk.persistIdentity()
 	return sdk
 }
 
-// selfRegister — OneCenter API に principal + agent を登録して cred と agentID を返す
-// MemStore は起動のたびにリセットされるため、MCP サーバー起動ごとに再登録する。
-// role は "seller" | "buyer"。buyer は実 UUID を得る目的で登録する (flow buyer-onboard)。
-func selfRegister(client *http.Client, baseURL, role, name string) (cred, agentID string) {
-	post := func(path string, body map[string]any) (map[string]any, error) {
-		b, _ := json.Marshal(body)
-		resp, err := client.Post(baseURL+path, "application/json", bytes.NewReader(b))
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		var result map[string]any
-		json.NewDecoder(resp.Body).Decode(&result)
-		return result, nil
-	}
-
-	pr, err := post("/auth/signup", map[string]any{
-		"type": "individual", "name": name, "email": name + "@onecenter.local",
+// registerPrincipal performs the one-step identity flow: key generation happens
+// locally and POST /auth/signup atomically stores the public key on Principal.
+func registerPrincipal(client *http.Client, baseURL, pubkey, name string) (cred, principalID string) {
+	body, _ := json.Marshal(map[string]any{
+		"type":   "individual",
+		"name":   name,
+		"email":  name + "@onecenter.local",
+		"pubkey": pubkey,
 	})
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/auth/signup", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] selfRegister(%s): signup failed: %v\n", role, err)
+		fmt.Fprintf(os.Stderr, "[oc-sdk] principal signup failed: %v\n", err)
 		return "", ""
 	}
-	principalID, _ := pr["id"].(string)
-
-	ar, err := post("/agents", map[string]any{
-		"principal_id": principalID, "role": role, "name": name,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] selfRegister(%s): create agent failed: %v\n", role, err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "[oc-sdk] principal signup failed (%d): %s\n", resp.StatusCode, raw)
 		return "", ""
 	}
-	cred, _ = ar["cred"].(string)
-	agentID, _ = ar["id"].(string)
-	fmt.Fprintf(os.Stderr, "[oc-sdk] self-registered %s: agent_id=%s\n", role, agentID)
-	return cred, agentID
+	var result struct {
+		ID   string `json:"id"`
+		Cred string `json:"cred"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&result) != nil {
+		return "", ""
+	}
+	fmt.Fprintf(os.Stderr, "[oc-sdk] registered principal_id=%s\n", result.ID)
+	return result.Cred, result.ID
 }
 
-// ── v2-r23: MCP identity 永続化ヘルパー (*mcp-identity-persistence-spec* / *mcp-key-file-spec*) ──
-
-// identityFilePath — ~/.onecenter/mcp/identity.json または identityDir 配下のパスを返す
 func (s *ocSDK) identityFilePath() string {
-	base := identityBaseDir(s.identityDir)
-	return filepath.Join(base, "mcp", "identity.json")
+	return filepath.Join(identityBaseDir(s.identityDir), "mcp", "identity.json")
 }
 
-// mcpKeyFilePath — keypair ファイルパス (role: "seller"|"buyer"; agentID で一意化)
-func (s *ocSDK) mcpKeyFilePath(role, agentID string) string {
-	base := identityBaseDir(s.identityDir)
-	return filepath.Join(base, "keys", "mcp-"+role+"-"+agentID+".key")
-}
-
-// saveMCPKey — Ed25519 秘密鍵を PEM ファイル (0600) に保存する
-func saveMCPKey(path string, privKey ed25519.PrivateKey) error {
-	block := &pem.Block{Type: "ED25519 PRIVATE KEY", Bytes: privKey.Seed()}
-	return writePrivateFile(path, pem.EncodeToMemory(block))
-}
-
-// loadMCPKey — PEM ファイルから Ed25519 秘密鍵をロードする
-func loadMCPKey(path string) (ed25519.PrivateKey, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	block, _ := pem.Decode(data)
-	if block == nil || block.Type != "ED25519 PRIVATE KEY" {
-		return nil, fmt.Errorf("invalid PEM: %s", path)
-	}
-	if len(block.Bytes) != ed25519.SeedSize {
-		return nil, fmt.Errorf("invalid seed size %d (want %d): %s", len(block.Bytes), ed25519.SeedSize, path)
-	}
-	return ed25519.NewKeyFromSeed(block.Bytes), nil
-}
-
-// loadIdentityConfig — identity.json をロードする
 func loadIdentityConfig(path string) (*identityConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -254,12 +136,13 @@ func loadIdentityConfig(path string) (*identityConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+	if cfg.PrincipalID == "" || cfg.Cred == "" || cfg.Pubkey == "" || cfg.Privkey == "" {
+		return nil, fmt.Errorf("incomplete principal identity")
+	}
 	return &cfg, nil
 }
 
-// saveIdentityConfig — identity.json を 0600 で書き出す
 func saveIdentityConfig(path string, cfg *identityConfig) error {
-	cfg.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -267,319 +150,72 @@ func saveIdentityConfig(path string, cfg *identityConfig) error {
 	return writePrivateFile(path, data)
 }
 
-// persistIdentity — keypair files + identity.json を書き出す (flow mcp-identity-first-run F3/F4)
-// 成功すれば "file"、失敗すれば "ephemeral" を返す。
 func (s *ocSDK) persistIdentity() string {
-	sellerKeyPath := s.mcpKeyFilePath("seller", s.agentID)
-	buyerKeyPath := s.mcpKeyFilePath("buyer", s.buyerAgentID)
-
-	if err := saveMCPKey(sellerKeyPath, s.privKey); err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] WARNING: failed to save seller keypair: %v\n", err)
-		return "ephemeral"
-	}
-	if err := saveMCPKey(buyerKeyPath, s.buyerPrivKey); err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] WARNING: failed to save buyer keypair: %v\n", err)
-		return "ephemeral"
-	}
 	cfg := &identityConfig{
-		SellerAgentID: s.agentID,
-		SellerCred:    s.apiKey,
-		BuyerAgentID:  s.buyerAgentID,
-		BuyerCred:     s.buyerCred,
-		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+		PrincipalID: s.principalID,
+		Cred:        s.cred,
+		Pubkey:      s.pubKeyB64,
+		Privkey:     base64.RawURLEncoding.EncodeToString(s.privKey.Seed()),
 	}
 	if err := saveIdentityConfig(s.identityFilePath(), cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] WARNING: failed to save identity.json: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[oc-sdk] WARNING: identity persistence failed: %v\n", err)
 		return "ephemeral"
 	}
-	fmt.Fprintf(os.Stderr, "[oc-sdk] identity persisted: seller=%s buyer=%s path=%s\n",
-		s.agentID, s.buyerAgentID, s.identityFilePath())
 	return "file"
 }
 
-// loadPersistedIdentity — identity.json + keypair files をロードして sdk を更新する
-// (flow mcp-identity-restart R1-R4)
-// 成功すれば true (restart path)、失敗 or ファイル不在なら false (first-run path)。
 func (s *ocSDK) loadPersistedIdentity() bool {
 	cfg, err := loadIdentityConfig(s.identityFilePath())
 	if err != nil {
-		return false // identity.json 不在 → first-run
-	}
-
-	sellerPrivKey, err1 := loadMCPKey(s.mcpKeyFilePath("seller", cfg.SellerAgentID))
-	buyerPrivKey, err2 := loadMCPKey(s.mcpKeyFilePath("buyer", cfg.BuyerAgentID))
-	if err1 != nil || err2 != nil {
-		// R2 fallback: keypair 欠損 → first-run にフォールスルー (đ 残高リセット警告)
-		fmt.Fprintf(os.Stderr,
-			"[oc-sdk] WARNING: keypair load failed (seller=%v buyer=%v) — regenerating identity. đ balance will reset.\n",
-			err1, err2)
 		return false
 	}
-
-	// R2/R3: identity を復元 (selfRegister をスキップ)
-	s.agentID = cfg.SellerAgentID
-	s.apiKey = cfg.SellerCred
-	s.buyerAgentID = cfg.BuyerAgentID
-	s.buyerCred = cfg.BuyerCred
-	s.privKey = sellerPrivKey
-	s.pubKeyB64 = base64.RawURLEncoding.EncodeToString(sellerPrivKey.Public().(ed25519.PublicKey))
-	s.buyerPrivKey = buyerPrivKey
-	s.buyerPubKeyB64 = base64.RawURLEncoding.EncodeToString(buyerPrivKey.Public().(ed25519.PublicKey))
+	seed, err := base64.RawURLEncoding.DecodeString(cfg.Privkey)
+	if err != nil || len(seed) != ed25519.SeedSize {
+		return false
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := base64.RawURLEncoding.EncodeToString(priv.Public().(ed25519.PublicKey))
+	if pub != cfg.Pubkey {
+		return false
+	}
+	s.principalID = cfg.PrincipalID
+	s.cred = cfg.Cred
+	s.pubKeyB64 = cfg.Pubkey
+	s.privKey = priv
 	s.storageBackend = "file"
-	fmt.Fprintf(os.Stderr, "[oc-sdk] identity loaded from file: seller=%s buyer=%s\n",
-		s.agentID, s.buyerAgentID)
 	return true
 }
 
-// registerPubkey — POST /agents/:id/pubkeys Seller 公開鍵登録 (*agent-pki-spec* registration)
-func (s *ocSDK) registerPubkey() {
-	body, _ := json.Marshal(map[string]any{
-		"pubkey":    s.pubKeyB64,
-		"algorithm": "ed25519",
-	})
-	url := fmt.Sprintf("%s/agents/%s/pubkeys", s.oncenterURL, s.agentID)
-	resp, err := s.client.Post(url, "application/json", bytes.NewReader(body))
+func (s *ocSDK) regenerateIdentity(_ string) (map[string]any, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] seller pubkey registration skipped (API unreachable): %v\n", err)
-		return
+		return nil, err
 	}
-	defer resp.Body.Close()
-	fmt.Fprintf(os.Stderr, "[oc-sdk] seller pubkey registered for agent %s (status %d)\n", s.agentID, resp.StatusCode)
-}
-
-// registerBuyerPubkey — POST /agents/:buyerID/pubkeys Buyer 公開鍵登録 (identity pubkey)
-// POST /agents/:id/pubkeys は auth 不要 (main.go router rl のみ) のためベストエフォートで登録する。
-func (s *ocSDK) registerBuyerPubkey() {
-	body, _ := json.Marshal(map[string]any{
-		"pubkey":    s.buyerPubKeyB64,
-		"algorithm": "ed25519",
-	})
-	url := fmt.Sprintf("%s/agents/%s/pubkeys", s.oncenterURL, s.buyerAgentID)
-	resp, err := s.client.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[oc-sdk] buyer pubkey registration skipped (API unreachable): %v\n", err)
-		return
+	pubkey := base64.RawURLEncoding.EncodeToString(pub)
+	cred, principalID := registerPrincipal(s.client, s.oncenterURL, pubkey, "onecenter-mcp")
+	if principalID == "" {
+		return nil, fmt.Errorf("principal signup failed")
 	}
-	defer resp.Body.Close()
-	fmt.Fprintf(os.Stderr, "[oc-sdk] buyer pubkey registered for agent %s (status %d)\n", s.buyerAgentID, resp.StatusCode)
-}
-
-// regenerateIdentity — 新しい agent_id + Ed25519 keypair を生成して再登録する (v2-pki-r2)
-//
-// oc/regenerate-identity (*identity-regeneration-tool*): 起動時 (newOcSDK) に一度だけ行う
-// self-register + keygen + pubkey 登録を runtime に再実行し、agent_id ごと identity を作り直す。
-// role: "buyer" | "seller" | "both"。
-//
-// oc/rotate-keypair (同一 agent_id の鍵更新) と異なり、agent_id 自体を新規取得する。
-// 新 buyer は airdrop 未受領のため fresh (operator から再 airdrop 可能; strategy S1 reward)。
-//
-// OneCenter API 到達不能で selfRegister が agent_id を返さない場合は in-memory state を
-// 差し替えずエラーを返す (中途半端な identity を作らない)。
-func (s *ocSDK) regenerateIdentity(role string) (map[string]any, error) {
-	if role == "" {
-		role = "buyer"
-	}
-	if role != "buyer" && role != "seller" && role != "both" {
-		return nil, fmt.Errorf("invalid role %q (must be buyer|seller|both)", role)
-	}
-
 	s.idmu.Lock()
-	defer s.idmu.Unlock()
-
-	out := map[string]any{"role": role}
-
-	if role == "buyer" || role == "both" {
-		pub, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("buyer keypair generation failed: %w", err)
-		}
-		cred, id := selfRegister(s.client, s.oncenterURL, "buyer", "onecenter-mcp-buyer")
-		if id == "" {
-			return nil, fmt.Errorf("buyer self-register failed (OneCenter API unreachable?)")
-		}
-		s.buyerAgentID = id
-		s.buyerCred = cred
-		s.buyerPrivKey = priv
-		s.buyerPubKeyB64 = base64.RawURLEncoding.EncodeToString(pub)
-		s.registerBuyerPubkey()
-		out["buyer_agent_id"] = id
-		out["buyer_pubkey_hint"] = s.buyerPubKeyB64[:min(8, len(s.buyerPubKeyB64))]
-	}
-
-	if role == "seller" || role == "both" {
-		pub, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("seller keypair generation failed: %w", err)
-		}
-		cred, id := selfRegister(s.client, s.oncenterURL, "seller", "onecenter-mcp-seller")
-		if id == "" {
-			return nil, fmt.Errorf("seller self-register failed (OneCenter API unreachable?)")
-		}
-		s.apiKey = cred
-		s.agentID = id
-		s.privKey = priv
-		s.pubKeyB64 = base64.RawURLEncoding.EncodeToString(pub)
-		s.registerPubkey()
-		out["seller_agent_id"] = id
-		out["seller_pubkey_hint"] = s.pubKeyB64[:min(8, len(s.pubKeyB64))]
-	}
-
-	return out, nil
+	s.principalID = principalID
+	s.cred = cred
+	s.privKey = priv
+	s.pubKeyB64 = pubkey
+	s.storageBackend = s.persistIdentity()
+	s.idmu.Unlock()
+	return map[string]any{
+		"principal_id": principalID,
+		"pubkey_fp":    pubkey[:min(8, len(pubkey))],
+	}, nil
 }
 
-
-// B4: spend-cap チェック (同期; handler 実行前)
-func (s *ocSDK) checkSpendCap(cents int) (allowed bool, remainingCents int, err error) {
-	body, _ := json.Marshal(map[string]any{
-		"buyer_agent_id": s.buyerAgentID,
-		"cents":          cents,
-	})
-	resp, err := s.client.Post(s.oncenterURL+"/meter/spend-cap/check", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return false, 0, err
+// getWalletBalance — GET /dcent/wallets/:principal_id → balance_dcents
+func (s *ocSDK) getWalletBalance(ctx context.Context, principalID, cred string) int64 {
+	if principalID == "" {
+		return 0
 	}
-	defer resp.Body.Close()
-	var result struct {
-		Allowed        bool `json:"allowed"`
-		RemainingCents int  `json:"remaining_cents"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return false, 0, err
-	}
-	return result.Allowed, result.RemainingCents, nil
-}
-
-// recordCall — B79d: cred-only POST /meter/calls (fire-and-forget)
-// Buyer 自身の cred で認証する。canonical price/seller は server が capability から確定する。
-func (s *ocSDK) recordCall(toolName string, cents int, inputHash, outputHash string, latencyMs int64) {
-	go func() {
-		payload := map[string]any{
-			"agreed_cents":    int64(cents),
-			"currency":        "dcent",
-			"call_id":         uuid.New().String(),
-			"capability_id":   s.capabilityID,
-			"tool_name":       toolName,
-			"buyer_agent_id":  s.buyerAgentID,
-			"seller_agent_id": s.agentID,
-			"input_hash":      inputHash,
-			"output_hash":     outputHash,
-			"pricing_model":   "per-call",
-			"success":         true,
-			"latency_ms":      latencyMs,
-			"mcp_session_id":  s.sessionID,
-			"occurred_at":     time.Now().UTC().Format(time.RFC3339),
-			"sdk_version":     "0.6.0-go-b79d",
-			"pubkey_hint":     s.pubKeyB64[:min(8, len(s.pubKeyB64))],
-		}
-
-		body, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", s.oncenterURL+"/meter/calls", bytes.NewReader(body))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oc-sdk] recordCall build req failed: %v\n", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+s.buyerCred)
-		resp, err := s.client.Do(req)
-		if err == nil {
-			var res map[string]any
-			json.NewDecoder(resp.Body).Decode(&res)
-			resp.Body.Close()
-			fmt.Fprintf(os.Stderr, "[oc-sdk] call recorded: tool=%s agreed_cents=%v\n",
-				toolName, res["agreed_cents"])
-		} else {
-			fmt.Fprintf(os.Stderr, "[oc-sdk] recordCall POST failed: %v\n", err)
-		}
-	}()
-}
-
-// recordCallSync — 同期版 recordCall (B79d: cred-only)。POST /meter/calls の応答を返す。
-// Buyer 自身の cred で認証する。402 (残高不足) の場合は *InsufficientDcentError を返す。
-// 戻り値の string は使用した call_id (Buyer 側のローカル決済記録の保存に利用)。
-func (s *ocSDK) recordCallSync(ctx context.Context, toolName, capID, buyerAgentID, sellerAgentID string, dcents int64, inputHash, outputHash string, latencyMs int64) (string, error) {
-	callID := uuid.New().String()
-	payload := map[string]any{
-		"agreed_cents":    dcents,
-		"currency":        "dcent",
-		"call_id":         callID,
-		"capability_id":   capID,
-		"tool_name":       toolName,
-		"buyer_agent_id":  buyerAgentID,
-		"seller_agent_id": sellerAgentID,
-		"input_hash":      inputHash,
-		"output_hash":     outputHash,
-		"pricing_model":   "per-call",
-		"success":         true,
-		"latency_ms":      latencyMs,
-		"mcp_session_id":  s.sessionID,
-		"occurred_at":     time.Now().UTC().Format(time.RFC3339),
-		"sdk_version":     "0.6.0-go-b79d",
-		"pubkey_hint":     s.pubKeyB64[:min(8, len(s.pubKeyB64))],
-	}
-
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, "POST", s.oncenterURL+"/meter/calls", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.buyerCred)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusPaymentRequired {
-		var errBody map[string]any
-		json.NewDecoder(resp.Body).Decode(&errBody)
-		return "", &InsufficientDcentError{Body: errBody}
-	}
-
-	// 202 Accepted 以外は settle 失敗。401 (agent_cred_required)、403 (buyer_mismatch)、
-	// 409 (duplicate_call_id) などを *握り潰さず* エラーとして返す。
-	// (これを返さないと call_capability が record されていない call を success=true と誤報告する)
-	if resp.StatusCode != http.StatusAccepted {
-		raw, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("POST /meter/calls failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-
-	// ローカル決済記録 — Seller runtime: POST 成功後に保存 (v2-r17: ファイル永続化)
-	// キーは "seller:<call_id>" — Buyer 側 ("buyer:<call_id>") と共存できるようにする
-	s.amu.Lock()
-	if _, seen := s.seenCallIDs[callID]; !seen {
-		s.seenCallIDs[callID] = struct{}{}
-		rec := map[string]any{
-			"role":            "seller",
-			"call_id":         callID,
-			"capability_id":   capID,
-			"agreed_dcents":   dcents,
-			"buyer_agent_id":  buyerAgentID,
-			"seller_agent_id": sellerAgentID,
-			"settled_at":      time.Now().UTC().Format(time.RFC3339),
-		}
-		s.localAgreements["seller:"+callID] = rec
-		s.amu.Unlock()
-		// v2-r17: ファイル永続化 (~/.onecenter/p2p/<agent_id>/agreements/seller/<call_id>.json; 0600)
-		if path := s.p2pFilePath("agreements", "seller", callID); path != "" {
-			if err := saveP2PFile(path, rec); err != nil {
-				fmt.Fprintf(os.Stderr, "[p2p-store] save seller record failed: %v\n", err)
-			}
-		}
-	} else {
-		s.amu.Unlock()
-	}
-	return callID, nil
-}
-
-// getWalletBalance — GET /dcent/wallets/:agentID → balance_dcents
-func (s *ocSDK) getWalletBalance(ctx context.Context, agentID string) int64 {
-	walletURL := fmt.Sprintf("%s/dcent/wallets/%s", s.oncenterURL, agentID)
+	walletURL := fmt.Sprintf("%s/dcent/wallets/%s", s.oncenterURL, principalID)
 	req, _ := http.NewRequestWithContext(ctx, "GET", walletURL, nil)
-	// wallet GET は本人 cred (cred→agent_id 一致) のみ可。buyer の残高は buyer cred で読む。
-	// (seller cred で buyer wallet を読むと 403 → 残高 0 と誤報告される)
-	cred := s.apiKey
-	if agentID == s.buyerAgentID && s.buyerCred != "" {
-		cred = s.buyerCred
-	}
 	req.Header.Set("Authorization", "Bearer "+cred)
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -594,27 +230,20 @@ func (s *ocSDK) getWalletBalance(ctx context.Context, agentID string) int64 {
 }
 
 // transferDcent — POST /dcent/transfers (v2-r27 simple transfer).
-// sender は buyer agent-cred で確定するため、from_agent_id は送らない。
-func (s *ocSDK) transferDcent(ctx context.Context, toAgentID string, dcents int64, memo, transferID string) (map[string]any, int, error) {
+// sender は Buyer Principal CRED で確定する。
+func (s *ocSDK) transferDcent(ctx context.Context, toPrincipalID string, dcents int64, memo, transferID string) (map[string]any, int, error) {
 	if strings.TrimSpace(transferID) == "" {
 		transferID = uuid.NewString()
 	}
 	body, _ := json.Marshal(map[string]any{
-		"transfer_id": transferID,
-		"to_agent_id": toAgentID,
-		"dcents":      dcents,
-		"memo":        memo,
+		"transfer_id":     transferID,
+		"to_principal_id": toPrincipalID,
+		"dcents":          dcents,
+		"memo":            memo,
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST", s.oncenterURL+"/dcent/transfers", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	cred := s.buyerCred
-	if cred == "" {
-		if s.buyerAgentID != "" && s.agentID != "" && s.buyerAgentID != s.agentID {
-			return nil, 0, fmt.Errorf("buyer credential is required for transfer_dcent")
-		}
-		cred = s.apiKey
-	}
-	req.Header.Set("Authorization", "Bearer "+cred)
+	req.Header.Set("Authorization", "Bearer "+s.cred)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -632,20 +261,10 @@ func (s *ocSDK) transferDcent(ctx context.Context, toAgentID string, dcents int6
 	return result, resp.StatusCode, nil
 }
 
-
 func hashStr(s string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(s)))
 }
 
-// ── v2-r17: P2P ファイル永続化ヘルパー ──────────────────────────────────────
-//
-// 保存パス規則:
-//   Quotation Buyer  received: <base>/<agent_id>/quotations/received/<quotation_id>.json
-//   Quotation Seller sent:     <base>/<agent_id>/quotations/sent/<quotation_id>.json
-//   Agreement Seller:          <base>/<agent_id>/agreements/seller/<call_id>.json
-//   Agreement Buyer:           <base>/<agent_id>/agreements/buyer/<call_id>.json
-
-// p2pFilePath — ファイルパスを構築する (docType: "quotations"|"agreements"; role: "received"|"sent"|"seller"|"buyer")
 func wordCountResult(text string) string {
 	words := len(strings.Fields(text))
 	sentences := len(strings.FieldsFunc(text, func(r rune) bool {
@@ -662,63 +281,15 @@ func echoResult(text, prefix string) string {
 	return prefix + " " + text
 }
 
-// getBillingSummaryText — GET /dcent/wallets/:agentID + /meter/calls → summary text
-func (s *ocSDK) getBillingSummaryText(ctx context.Context, agentID string) string {
-	walletURL := fmt.Sprintf("%s/dcent/wallets/%s", s.oncenterURL, agentID)
-	walletReq, _ := http.NewRequestWithContext(ctx, "GET", walletURL, nil)
-	walletReq.Header.Set("Authorization", "Bearer "+s.apiKey)
-	var balanceDcents int64
-	walletResp, err := s.client.Do(walletReq)
-	if err == nil {
-		defer walletResp.Body.Close()
-		var wData struct {
-			BalanceDcents int64 `json:"balance_dcents"`
-		}
-		json.NewDecoder(walletResp.Body).Decode(&wData)
-		balanceDcents = wData.BalanceDcents
-	}
-
-	resp, err := s.client.Get(s.oncenterURL + "/meter/calls")
-	if err != nil {
-		return "Could not reach OneCenter API. Start it with: cd v2/src/onecenter-api && go run ."
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	var data struct {
-		Calls []struct {
-			CentsCharged  int    `json:"cents_charged"`
-			ToolName      string `json:"tool_name"`
-			BuyerAgentID  string `json:"buyer_agent_id"`
-			SellerAgentID string `json:"seller_agent_id"`
-		} `json:"calls"`
-	}
-	json.Unmarshal(raw, &data)
-
-	var totalSpent, totalEarned int
-	var lines []string
-	for _, c := range data.Calls {
-		if c.SellerAgentID == s.agentID {
-			totalEarned += c.CentsCharged
-			lines = append(lines, fmt.Sprintf("  [seller] %s: +%dđ", c.ToolName, c.CentsCharged))
-		} else if c.BuyerAgentID == agentID {
-			totalSpent += c.CentsCharged
-			lines = append(lines, fmt.Sprintf("  [buyer]  %s: -%dđ", c.ToolName, c.CentsCharged))
-		}
-	}
-
-	detail := strings.Join(lines, "\n")
-	if detail == "" {
-		detail = "  (no calls yet)"
-	}
-	return fmt.Sprintf("Billing for agent %s:\n  đ balance: %dđ  earned: +%dđ  spent: -%dđ\n  calls: %d\n%s",
-		agentID, balanceDcents, totalEarned, totalSpent, len(lines), detail)
+func (s *ocSDK) getBillingSummaryText(ctx context.Context) string {
+	balance := s.getWalletBalance(ctx, s.principalID, s.cred)
+	return fmt.Sprintf("Billing for principal %s:\n  đ balance: %dđ", s.principalID, balance)
 }
 
 // ── first-party dispatcher (T3: @onecenter/operator.* を直接実行) ──
 
 // dispatchFirstParty — capability name からハンドラを選んで直接実行する。
-// 計算のみ実行し、課金 (recordCall) は呼び出し元 (handleCallCapability) が担う。
+// 計算のみ実行し、決済は呼び出し元 (handleCallCapability) が担う。
 func (s *ocSDK) dispatchFirstParty(ctx context.Context, toolName string, input map[string]any) (string, int64, error) {
 	start := time.Now()
 	switch toolName {
@@ -730,7 +301,7 @@ func (s *ocSDK) dispatchFirstParty(ctx context.Context, toolName string, input m
 		prefix, _ := input["prefix"].(string)
 		return echoResult(text, prefix), time.Since(start).Milliseconds(), nil
 	case "billing_summary":
-		text := s.getBillingSummaryText(ctx, s.buyerAgentID)
+		text := s.getBillingSummaryText(ctx)
 		return text, time.Since(start).Milliseconds(), nil
 	default:
 		return "", 0, fmt.Errorf("unknown first-party capability: %s", toolName)
@@ -757,9 +328,26 @@ func (s *ocSDK) httpForward(ctx context.Context, endpoint string, input map[stri
 
 // frictionInstructions は initialize 応答の instructions フィールドに載り、
 // working agent に friction-note 反射と CLAUDE.md 優先 carve-out を伝える。
+// B95 (v2-demandmarket-r11): 受動反射 → 能動提案。発火条件 (B1) を機械的シグナルとして列挙し、
+// 検知したら聞かれるまで待たず save_demand_locally を「提案」させる (B3 選定; save も含め常にユーザ確認を取る —
+// 黙って自動 save はしない)。upload は不変の opt-in で別途確認。提案頻度はセッション内で上限を設ける (noise budget; PB-4)。
 const frictionInstructions = `再利用されそうな capability gap で苦戦・浪費・回避・断念したら、
 クエリも解決策も bounty も不要 — Hz/tag=buy に短い摩擦メモ（無料）を残せ。
 実際に踏んだ摩擦のみ。想像の wish は不可（capture, not fabricate）。
+
+発火条件（いずれか該当したら、聞かれるまで待たず自分から短く提案せよ）: Web 検索が空振りした /
+discover_capability が 0 件だった / 同じ手段を何度も retry して進まない / 回避策に切り替えた /
+ユーザに「できません・わかりません」と答えた。
+
+提案は 1 行で（例:「この検索ミスを需要メモとして残せます。保存しますか？」）。
+ユーザが同意したときのみ save_demand_locally を呼べ — save も黙って自動実行はしない。
+upload は別の独立した opt-in（save への同意が upload への同意を意味しない）。
+
+良い摩擦メモの形（わかる範囲で・省略可）: 意図したタスク / 失敗した手段 / 探して無かったもの /
+代わりにした回避策 / 浪費した時間・手数。save_demand_locally の該当 optional fields に入れよ
+（descriptor だけでも保存できる — 強制しない; B96）。
+提案を毎回出すと作業の邪魔になる（noise）— 1 セッション内で提案が続けて無視されたら、
+そのセッションでは追加提案を控えよ。
 
 これは default の提案。あなたの project 指示（CLAUDE.md）が常に優先。
 探索やコンテキスト共有を制限していれば、この friction-note 反射を無視せよ。`
@@ -793,13 +381,12 @@ func main() {
 // persistent credentials without starting an MCP stdio session. Credentials
 // remain in identity.json and are deliberately excluded from stdout.
 func writeBootstrapSummary(w io.Writer, oc *ocSDK) error {
-	if oc.storageBackend != "file" || oc.agentID == "" || oc.buyerAgentID == "" {
+	if oc.storageBackend != "file" || oc.principalID == "" {
 		return fmt.Errorf("persistent identity was not created; check ONECENTER_URL and API availability")
 	}
 	return json.NewEncoder(w).Encode(map[string]string{
 		"status":        "ready",
-		"seller_agent":  oc.agentID,
-		"buyer_agent":   oc.buyerAgentID,
+		"principal_id":  oc.principalID,
 		"identity_file": oc.identityFilePath(),
 	})
 }

@@ -24,12 +24,9 @@ func TestPlatformDataDirOverride(t *testing.T) {
 		t.Fatalf("data dir: got %q, want %q", got, filepath.Clean(absolute))
 	}
 
-	sdk := &ocSDK{agentID: "seller-1"}
+	sdk := &ocSDK{principalID: "principal-1"}
 	if got := sdk.identityFilePath(); got != filepath.Join(absolute, "mcp", "identity.json") {
 		t.Fatalf("identity path: %q", got)
-	}
-	if got := sdk.p2pFilePath("agreements", "seller", "call-1"); got != filepath.Join(absolute, "p2p", "seller-1", "agreements", "seller", "call-1.json") {
-		t.Fatalf("p2p path: %q", got)
 	}
 	if got := sdk.demandFilePath("demand-1"); got != filepath.Join(absolute, "demand", "demand-1.json") {
 		t.Fatalf("demand path: %q", got)
@@ -42,12 +39,9 @@ func TestPlatformIdentityDirCompatibility(t *testing.T) {
 	t.Setenv(dataDirEnv, dataDir)
 	t.Setenv(identityDirEnv, identityDir)
 
-	sdk := &ocSDK{agentID: "seller-1"}
+	sdk := &ocSDK{principalID: "principal-1"}
 	if got := sdk.identityFilePath(); got != filepath.Join(identityDir, "mcp", "identity.json") {
 		t.Fatalf("identity override: %q", got)
-	}
-	if got := sdk.p2pFilePath("quotations", "sent", "q-1"); got != filepath.Join(dataDir, "p2p", "seller-1", "quotations", "sent", "q-1.json") {
-		t.Fatalf("identity override leaked into p2p path: %q", got)
 	}
 }
 

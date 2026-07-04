@@ -16,6 +16,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -38,9 +39,8 @@ func TestSaveDemandLocally_DM_A1(t *testing.T) {
 	sdk := newDemandTestSDK(t, ts)
 
 	req := makeCallReq(map[string]any{
-		"descriptor":         "PDF の表を抽出する API",
-		"raw_friction":       "決算PDFの表を機械可読にしたいのに見つからなかった",
-		"unmet_value_dcents": float64(120),
+		"descriptor":   "PDF の表を抽出する API",
+		"raw_friction": "決算PDFの表を機械可読にしたいのに見つからなかった",
 	})
 	result, err := sdk.handleSaveDemandLocally(context.Background(), req)
 	if err != nil {
@@ -63,10 +63,10 @@ func TestSaveDemandLocally_DM_A1(t *testing.T) {
 	if !out.Saved || out.Uploaded || out.DemandRecordID == "" {
 		t.Fatalf("DM-A1: expected saved=true uploaded=false with id, got %+v", out)
 	}
-	if out.NextAction != "call_upload_demand_for_preview" {
-		t.Fatalf("DM-A1: expected next_action=call_upload_demand_for_preview, got %+v", out)
+	if out.NextAction != "batch_review_at_next_pause" {
+		t.Fatalf("DM-A1: expected next_action=batch_review_at_next_pause, got %+v", out)
 	}
-	for _, required := range []string{"upload_demand", "demand_record_id", "preview"} {
+	for _, required := range []string{"upload_demand", "list_local_demands", "preview"} {
 		if !strings.Contains(out.AssistantInstruction, required) {
 			t.Fatalf("DM-A1: assistant instruction must contain %q, got %q", required, out.AssistantInstruction)
 		}
@@ -97,6 +97,9 @@ func TestSaveDemandLocally_DM_A1(t *testing.T) {
 	}
 	if rec["raw_friction"] != "決算PDFの表を機械可読にしたいのに見つからなかった" {
 		t.Fatalf("DM-A1: raw_friction not persisted locally")
+	}
+	if _, exists := rec["unmet_"+"value_dcents"]; exists {
+		t.Fatalf("B88: local record retained removed buyer price: %v", rec)
 	}
 }
 
@@ -153,10 +156,9 @@ func TestUploadDemand_DM_A2_PreviewThenConfirm(t *testing.T) {
 	sdk := newDemandTestSDK(t, ts)
 
 	saveRes, _ := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
-		"descriptor":         "PDF 表抽出 API",
-		"raw_friction":       "SECRET-PROJECT の決算処理で詰まった",
-		"context":            "social-graph 案件",
-		"unmet_value_dcents": float64(200),
+		"descriptor":   "PDF 表抽出 API",
+		"raw_friction": "SECRET-PROJECT の決算処理で詰まった",
+		"context":      "social-graph 案件",
 	}))
 	var saved struct {
 		DemandRecordID string `json:"demand_record_id"`
@@ -214,6 +216,9 @@ func TestUploadDemand_DM_A2_PreviewThenConfirm(t *testing.T) {
 	if sig["zero_seller"] != true {
 		t.Fatalf("DM-A2 confirm: expected zero_seller=true, got %v", sig["zero_seller"])
 	}
+	if _, exists := sig["unmet_"+"value_dcents"]; exists {
+		t.Fatalf("B88: upload sent removed buyer price: %v", sig)
+	}
 	// B71 deliver-proxy: raw_friction と context も API に送る (server 側で暗号化して content_encrypted に保管)。
 	if sig["raw_friction"] != "SECRET-PROJECT の決算処理で詰まった" {
 		t.Fatalf("DM-A2 confirm: raw_friction must be sent for deliver-proxy (B71): %v", sig["raw_friction"])
@@ -268,6 +273,9 @@ func TestGetStatus_B58(t *testing.T) {
 	// mock wallet returns 995 balance
 	if out.BalanceDcents != 995 {
 		t.Errorf("B58: expected balance_dcents=995, got %d", out.BalanceDcents)
+	}
+	if mock.lastWalletPath != "/dcent/wallets/principal-1" {
+		t.Errorf("B92: wallet path=%q, want principal_id", mock.lastWalletPath)
 	}
 	if out.DemandsSavedLocally != 0 || out.DemandsUploaded != 0 || out.DemandsPendingUpload != 0 {
 		t.Errorf("B58: expected empty demands, got %+v", out)
@@ -389,60 +397,248 @@ func TestUploadDemand_NotFound(t *testing.T) {
 	}
 }
 
-// ── B76: unlock 価格は platform 固定値。アップロード者は価格を設定しない ──────────
-// save_demand_locally に min_unlock_dcents を渡しても保存されず、upload の POST body にも含まれないこと。
-func TestUploadDemand_B76_NoPerSignalUnlockPrice(t *testing.T) {
+// ── B86: per-signal unlock 価格の復活。upload_demand で min_unlock_dcents を指定でき、
+//
+//	省略時は platform デフォルト (100đ) が POST body に載ること (DM-A6)。──────────
+func TestUploadDemand_B86_PerSignalUnlockPrice(t *testing.T) {
 	mock := newMockAPI(nil)
 	ts := httptest.NewServer(mock)
 	defer ts.Close()
 	sdk := newDemandTestSDK(t, ts)
 
-	// save_demand_locally — 旧 min_unlock_dcents 引数を渡しても無視されること。
+	// (1) min_unlock_dcents を明示指定 → その値が POST body に載る。
 	saveRes, err := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
-		"descriptor":         "機械翻訳 API (DE→JA 専門語対応)",
-		"unmet_value_dcents": float64(50),
-		"min_unlock_dcents":  float64(100), // 旧パラメータ; 無視される
+		"descriptor": "機械翻訳 API (DE→JA 専門語対応)",
 	}))
 	if err != nil {
-		t.Fatalf("B76: save error: %v", err)
+		t.Fatalf("B86: save error: %v", err)
 	}
 	if toolResultIsError(saveRes) {
-		t.Fatalf("B76: unexpected save tool error: %s", toolResultText(saveRes))
+		t.Fatalf("B86: unexpected save tool error: %s", toolResultText(saveRes))
 	}
 	var saved struct {
 		DemandRecordID string `json:"demand_record_id"`
 	}
 	if err := json.Unmarshal([]byte(toolResultText(saveRes)), &saved); err != nil {
-		t.Fatalf("B76: bad save output JSON: %v", err)
+		t.Fatalf("B86: bad save output JSON: %v", err)
 	}
 
-	// 保存レコードに min_unlock_dcents フィールドが無いこと。
-	path := sdk.demandFilePath(saved.DemandRecordID)
-	raw, _ := os.ReadFile(path)
-	var rec map[string]any
-	if err := json.Unmarshal(raw, &rec); err != nil {
-		t.Fatalf("B76: bad record JSON: %v", err)
+	upRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id":  saved.DemandRecordID,
+		"min_unlock_dcents": float64(250),
+		"confirm":           true,
+	}))
+	if err != nil {
+		t.Fatalf("B86: upload error: %v", err)
 	}
-	if _, present := rec["min_unlock_dcents"]; present {
-		t.Fatalf("B76: stored record must not carry min_unlock_dcents, got %v", rec["min_unlock_dcents"])
+	if toolResultIsError(upRes) {
+		t.Fatalf("B86: unexpected upload tool error: %s", toolResultText(upRes))
+	}
+	if len(mock.demandSignals) != 1 {
+		t.Fatalf("B86: expected 1 demand signal posted, got %d", len(mock.demandSignals))
+	}
+	if got := mock.demandSignals[0]["min_unlock_dcents"]; got != float64(250) {
+		t.Fatalf("B86: posted signal must carry min_unlock_dcents=250, got %v", got)
 	}
 
-	// upload_demand (confirm=true) → POST body に min_unlock_dcents が含まれないこと。
+	// (2) min_unlock_dcents 省略 → platform デフォルト (100đ) が POST body に載る。
+	saveRes2, _ := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
+		"descriptor": "PDF 署名検証 API",
+	}))
+	var saved2 struct {
+		DemandRecordID string `json:"demand_record_id"`
+	}
+	json.Unmarshal([]byte(toolResultText(saveRes2)), &saved2)
+
+	upRes2, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved2.DemandRecordID,
+		"confirm":          true,
+	}))
+	if err != nil {
+		t.Fatalf("B86: upload (default) error: %v", err)
+	}
+	if toolResultIsError(upRes2) {
+		t.Fatalf("B86: unexpected upload (default) tool error: %s", toolResultText(upRes2))
+	}
+	if len(mock.demandSignals) != 2 {
+		t.Fatalf("B86: expected 2 demand signals posted, got %d", len(mock.demandSignals))
+	}
+	if got := mock.demandSignals[1]["min_unlock_dcents"]; got != float64(defaultMinUnlockDcents) {
+		t.Fatalf("B86: omitted min_unlock_dcents must default to %d, got %v", defaultMinUnlockDcents, got)
+	}
+}
+
+// ── B96 (A1): save_demand_locally accepts optional schema-of-a-good-friction fields
+// and upload_demand carries them (as an opaque JSON string) in the same encrypted channel
+// as raw_friction/context — never in the plaintext descriptor/zero_seller/min_unlock_dcents. ──
+func TestSaveAndUploadDemand_B96_StructuredFields(t *testing.T) {
+	mock := newMockAPI(nil)
+	ts := httptest.NewServer(mock)
+	defer ts.Close()
+	sdk := newDemandTestSDK(t, ts)
+
+	saveRes, err := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
+		"descriptor":      "決算PDFの表を機械可読にするAPI",
+		"raw_friction":    "決算PDFの表を抽出しようとして詰まった",
+		"intended_task":   "四半期決算資料からP/Lの表を抽出する",
+		"failed_approach": "pdftotext と汎用OCRを試した",
+		"missing_thing":   "表構造を保持したままJSON化するAPI",
+		"workaround":      "手で転記した",
+		"waste_amount":    "約2時間",
+	}))
+	if err != nil {
+		t.Fatalf("B96: save error: %v", err)
+	}
+	if toolResultIsError(saveRes) {
+		t.Fatalf("B96: unexpected save tool error: %s", toolResultText(saveRes))
+	}
+	var saved struct {
+		DemandRecordID string `json:"demand_record_id"`
+	}
+	if err := json.Unmarshal([]byte(toolResultText(saveRes)), &saved); err != nil {
+		t.Fatalf("B96: bad save output JSON: %v", err)
+	}
+
+	// preview (confirm=false): structured fields must appear only under will_encrypt_on_server,
+	// never under will_send (which is sent as plaintext to the server).
+	previewRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved.DemandRecordID,
+	}))
+	if err != nil {
+		t.Fatalf("B96: preview error: %v", err)
+	}
+	var preview struct {
+		WillSend            map[string]any `json:"will_send"`
+		WillEncryptOnServer map[string]any `json:"will_encrypt_on_server"`
+	}
+	if err := json.Unmarshal([]byte(toolResultText(previewRes)), &preview); err != nil {
+		t.Fatalf("B96: bad preview output JSON: %v", err)
+	}
+	if _, ok := preview.WillSend["intended_task"]; ok {
+		t.Fatalf("B96: structured fields must not appear in plaintext will_send: %+v", preview.WillSend)
+	}
+	structured, ok := preview.WillEncryptOnServer["structured"].(map[string]any)
+	if !ok {
+		t.Fatalf("B96: expected will_encrypt_on_server.structured map, got %+v", preview.WillEncryptOnServer)
+	}
+	if structured["intended_task"] != "四半期決算資料からP/Lの表を抽出する" {
+		t.Fatalf("B96: preview structured.intended_task mismatch: %+v", structured)
+	}
+
 	upRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
 		"demand_record_id": saved.DemandRecordID,
 		"confirm":          true,
 	}))
 	if err != nil {
-		t.Fatalf("B76: upload error: %v", err)
+		t.Fatalf("B96: upload error: %v", err)
 	}
 	if toolResultIsError(upRes) {
-		t.Fatalf("B76: unexpected upload tool error: %s", toolResultText(upRes))
+		t.Fatalf("B96: unexpected upload tool error: %s", toolResultText(upRes))
 	}
 	if len(mock.demandSignals) != 1 {
-		t.Fatalf("B76: expected 1 demand signal posted, got %d", len(mock.demandSignals))
+		t.Fatalf("B96: expected 1 demand signal posted, got %d", len(mock.demandSignals))
 	}
-	sig := mock.demandSignals[0]
-	if _, present := sig["min_unlock_dcents"]; present {
-		t.Fatalf("B76: posted signal must not carry min_unlock_dcents, got %v", sig["min_unlock_dcents"])
+	posted := mock.demandSignals[0]
+	if _, exposed := posted["intended_task"]; exposed {
+		t.Fatalf("B96: posted body must not expose structured fields as top-level plaintext: %+v", posted)
+	}
+	structuredJSON, _ := posted["structured"].(string)
+	if structuredJSON == "" {
+		t.Fatalf("B96: posted body must carry a non-empty opaque 'structured' JSON string: %+v", posted)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(structuredJSON), &decoded); err != nil {
+		t.Fatalf("B96: posted structured field is not valid JSON: %v", err)
+	}
+	if decoded["failed_approach"] != "pdftotext と汎用OCRを試した" {
+		t.Fatalf("B96: posted structured.failed_approach mismatch: %+v", decoded)
+	}
+}
+
+// ── B96: save_demand_locally still works with structured fields entirely omitted
+// (optional, F1 exhaust protection — never forced). ────────────────────────────
+func TestSaveAndUploadDemand_B96_StructuredFieldsOmitted(t *testing.T) {
+	mock := newMockAPI(nil)
+	ts := httptest.NewServer(mock)
+	defer ts.Close()
+	sdk := newDemandTestSDK(t, ts)
+
+	saveRes, err := sdk.handleSaveDemandLocally(context.Background(), makeCallReq(map[string]any{
+		"descriptor": "PDF の表を抽出する API",
+	}))
+	if err != nil || toolResultIsError(saveRes) {
+		t.Fatalf("B96: save without structured fields must still succeed: err=%v result=%s", err, toolResultText(saveRes))
+	}
+	var saved struct {
+		DemandRecordID string `json:"demand_record_id"`
+	}
+	json.Unmarshal([]byte(toolResultText(saveRes)), &saved)
+
+	upRes, err := sdk.handleUploadDemand(context.Background(), makeCallReq(map[string]any{
+		"demand_record_id": saved.DemandRecordID,
+		"confirm":          true,
+	}))
+	if err != nil || toolResultIsError(upRes) {
+		t.Fatalf("B96: upload without structured fields must still succeed: err=%v result=%s", err, toolResultText(upRes))
+	}
+	posted := mock.demandSignals[0]
+	if structuredJSON, _ := posted["structured"].(string); structuredJSON != "" {
+		t.Fatalf("B96: structured must be an empty string when no structured fields were provided, got %q", structuredJSON)
+	}
+}
+
+// ── B96: unlock_demand returns the emitter's structured fields alongside raw_friction
+// (deliver-proxy passthrough; server never parses the opaque JSON string). ────────
+func TestUnlockDemand_B96_ReturnsStructuredAlongsideRawFriction(t *testing.T) {
+	structuredJSON := `{"intended_task":"四半期決算資料からP/Lの表を抽出する","failed_approach":"pdftotext"}`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/demand/signals/sig-1/seed-requests", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"seed_request_id": "sr-1",
+			"status":          "delivered",
+			"seed_request": map[string]any{
+				"seed": map[string]any{
+					"io":         "決算PDFの表を抽出しようとして詰まった",
+					"context":    "四半期決算資料作業中",
+					"structured": structuredJSON,
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/demand/seed-requests/sr-1/accept", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "released"})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	sdk := newTestSDK(ts)
+
+	res, err := sdk.handleUnlockDemand(context.Background(), makeCallReq(map[string]any{
+		"signal_id":     "sig-1",
+		"bounty_dcents": float64(150),
+	}))
+	if err != nil {
+		t.Fatalf("B96: unlock error: %v", err)
+	}
+	if toolResultIsError(res) {
+		t.Fatalf("B96: unexpected unlock tool error: %s", toolResultText(res))
+	}
+	var out struct {
+		RawFriction string         `json:"raw_friction"`
+		Structured  map[string]any `json:"structured"`
+	}
+	if err := json.Unmarshal([]byte(toolResultText(res)), &out); err != nil {
+		t.Fatalf("B96: bad unlock output JSON: %v", err)
+	}
+	if out.RawFriction == "" {
+		t.Fatalf("B96: expected non-empty raw_friction")
+	}
+	if out.Structured["intended_task"] != "四半期決算資料からP/Lの表を抽出する" {
+		t.Fatalf("B96: expected structured.intended_task in unlock response, got %+v", out.Structured)
+	}
+	if out.Structured["failed_approach"] != "pdftotext" {
+		t.Fatalf("B96: expected structured.failed_approach in unlock response, got %+v", out.Structured)
 	}
 }
